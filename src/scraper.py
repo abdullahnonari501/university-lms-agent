@@ -69,10 +69,18 @@ def slugify(url: str) -> str:
 def extract_title_and_text(soup: BeautifulSoup) -> tuple[str, str]:
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+    # GIKI's WordPress theme (Kingster) duplicates the full nav menu in a
+    # hidden mobile-menu <div> that sits outside any <nav>/<header> tag, so
+    # tag-stripping alone lets it leak into every page's extracted text.
+    # #kingster-page-wrapper holds the actual per-page content and is present
+    # across every template checked (homepage, blog post, static page) --
+    # prefer it, and fall back to tag-stripping the whole doc if it's absent.
+    content = soup.find(id="kingster-page-wrapper") or soup
+
+    for tag in content(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
         tag.decompose()
 
-    text = soup.get_text(separator="\n")
+    text = content.get_text(separator="\n")
     lines = [line.strip() for line in text.splitlines()]
     cleaned = "\n".join(line for line in lines if line)
     return title, cleaned
