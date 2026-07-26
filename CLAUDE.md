@@ -60,11 +60,16 @@ editor + autocomplete only. Don't run both agents against the same repo.
 - Ollama + Qwen live on the Pop!_OS box
 - **Phase 1 scrape complete** (2026-07-26) — **1,094 pages** of clean text from
   `giki.edu.pk`: 614 courses, 319 pages, 152 personnel, 9 departments. 6.17 MB.
-  Sitemap-seeded (1,414 target URLs), 1,300 thin pages (<100 words) skipped,
+  Sitemap-seeded (1,414 target URLs), 319 thin pages (<100 words) skipped,
   only 4 failures, no STOP condition. Run via `src/overnight_scrape.py`;
   see `data/logs/run_summary.txt`.
-- **12,208 PDF/DOC/XLSX links inventoried** in `data/logs/found_documents.txt`
-  (URLs only — nothing downloaded or parsed). Feeds Phase 2.
+- **130 unique PDF/DOC files inventoried** in `data/logs/found_documents.txt`
+  (URLs only — nothing downloaded or parsed). The file has 12,208 *lines*, but
+  that's link occurrences: two footer PDFs account for 11,957 of them. Always
+  `cut -f1 ... | sort -u` before quoting a count.
+  **316 of the 319 thin pages link to a PDF** — the academic calendar, fee
+  schedules and clearance rules live in those docs, not in HTML. Phase 2 must
+  ingest them or the bot can't answer the most common student questions.
 
 **Next**
 - [ ] Embeddings / retrieval layer
