@@ -26,6 +26,10 @@ from scraper import USER_AGENT, build_session, extract_title_and_text, load_robo
 BASE_URL = "https://giki.edu.pk/"
 REQUEST_DELAY_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 15
+CONNECT_TIMEOUT_SECONDS = 10
+MAX_REQUEST_SECONDS = 90  # hard wall-clock cap per request, see fetch()
+MAX_RESPONSE_BYTES = 20 * 1024 * 1024
+MAX_REDIRECTS = 5
 MIN_WORD_COUNT = 100
 MAX_DATA_BYTES = 500 * 1024 * 1024
 MAX_FAILURE_RATE = 0.15
@@ -63,9 +67,46 @@ class StopCrawl(Exception):
         self.reason = reason
 
 
+def fetch(session: requests.Session, url: str) -> requests.Response:
+    """GET a URL under a hard wall-clock cap.
+
+    requests' `timeout` only bounds the gap between bytes, never total elapsed
+    time, so a server that trickles the body (or a long redirect chain) hangs
+    right past it -- this crawl stalled 15+ minutes on a single URL, twice,
+    with timeout=15 set. Stream the body and abort once the cap is exceeded.
+    """
+    deadline = time.monotonic() + MAX_REQUEST_SECONDS
+    resp = session.get(
+        url,
+        timeout=(CONNECT_TIMEOUT_SECONDS, REQUEST_TIMEOUT_SECONDS),
+        stream=True,
+    )
+    try:
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if time.monotonic() > deadline:
+                raise requests.exceptions.Timeout(
+                    f"exceeded {MAX_REQUEST_SECONDS}s wall-clock cap"
+                )
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                raise requests.exceptions.RequestException(
+                    f"response body exceeded {MAX_RESPONSE_BYTES} bytes"
+                )
+            chunks.append(chunk)
+    finally:
+        resp.close()
+
+    resp._content = b"".join(chunks)
+    resp._content_consumed = True
+    return resp
+
+
 def fetch_sitemap_urls(session: requests.Session, sitemap_name: str) -> list[str]:
     url = urljoin(BASE_URL, sitemap_name)
-    resp = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+    print(f"  fetching sitemap {sitemap_name} ...", flush=True)
+    resp = fetch(session, url)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
     return [el.find(f"{NS}loc").text for el in root.findall(f"{NS}url")]
@@ -158,7 +199,7 @@ def process_url(
     stats["fetch_attempts"] += 1
     status = None
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        resp = fetch(session, url)
         status = resp.status_code
         resp.raise_for_status()
     except requests.RequestException as exc:
@@ -203,7 +244,7 @@ def process_url(
     )
     stats["saved"] += 1
     stats[f"saved_{category}"] += 1
-    print(f"[{category}] saved ({stats['saved']}): {url}")
+    print(f"[{category}] saved ({stats['saved']}): {url}", flush=True)
 
     if len(manifest) % 25 == 0:
         MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -306,6 +347,7 @@ def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     session = build_session()
+    session.max_redirects = MAX_REDIRECTS  # bound redirect chains; each hop gets its own timeout
     robots = load_robots(session, BASE_URL)
 
     print("Fetching sitemaps...")

@@ -58,10 +58,15 @@ editor + autocomplete only. Don't run both agents against the same repo.
 - `.gitignore` (Python + Node; excludes venv, node_modules, .env, model weights)
 - Cursor tunnel connected, running as a persistent service
 - Ollama + Qwen live on the Pop!_OS box
+- **Phase 1 scrape complete** (2026-07-26) — **1,094 pages** of clean text from
+  `giki.edu.pk`: 614 courses, 319 pages, 152 personnel, 9 departments. 6.17 MB.
+  Sitemap-seeded (1,414 target URLs), 1,300 thin pages (<100 words) skipped,
+  only 4 failures, no STOP condition. Run via `src/overnight_scrape.py`;
+  see `data/logs/run_summary.txt`.
+- **12,208 PDF/DOC/XLSX links inventoried** in `data/logs/found_documents.txt`
+  (URLs only — nothing downloaded or parsed). Feeds Phase 2.
 
 **Next**
-- [ ] Scraper — nothing written yet
-- [ ] Data schema for scraped pages
 - [ ] Embeddings / retrieval layer
 - [ ] Qwen wired to retrieval
 - [ ] Chat UI
@@ -81,6 +86,18 @@ editor + autocomplete only. Don't run both agents against the same repo.
 
 **Stack:** `requests` + `beautifulsoup4`. Only reach for `playwright` if pages
 turn out to be JavaScript-rendered.
+
+**Two gotchas already paid for — don't rediscover them:**
+- `giki.edu.pk` doesn't send its TLS intermediate cert. Hence the vendored
+  `certs/rapidssl_intermediate.crt` + custom `build_session()`. Never "fix" this
+  with `verify=False`.
+- The theme (Kingster) duplicates the whole nav menu in a `<div>` **outside** any
+  `<nav>`/`<header>`, so tag-stripping alone leaks it into every page. Extraction
+  positively selects `#kingster-page-wrapper` instead.
+- `requests`' `timeout=` bounds only the *gap between bytes*, never total elapsed
+  time — a trickling server hung the crawl 15+ min mid-run, twice, with
+  `timeout=15` set. `fetch()` in `overnight_scrape.py` streams under a hard
+  90s wall-clock cap. Any new fetch code must go through it.
 
 **Open question:** the GIKI LMS itself is behind a login. The public website is
 scrapeable; the authenticated LMS is not, without institutional permission. Decide
