@@ -51,6 +51,9 @@ models/
 checkpoints/
 weights/
 
+# --- Scraped data / logs ---
+data/
+
 # --- IDE / editor ---
 .vscode/
 .idea/
