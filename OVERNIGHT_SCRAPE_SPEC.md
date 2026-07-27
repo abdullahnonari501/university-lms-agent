@@ -1,5 +1,8 @@
 # Overnight Scrape Spec — Phase 1 full crawl
 
+> **STATUS: COMPLETED 2026-07-26** — 1,094 pages scraped, no STOP condition.
+> See `data/logs/run_summary.txt` for full results.
+
 Read fully before executing. Work through phases in order. If anything in the
 STOP conditions triggers, stop and write a report — do not improvise past it.
 
