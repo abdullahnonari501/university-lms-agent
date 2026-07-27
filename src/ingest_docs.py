@@ -33,6 +33,10 @@ FAILED_LOG = LOGS_DIR / "phase2_failed_docs.txt"
 MIN_DOC_WORDS = 200
 PARSE_TIMEOUT_SECONDS = 600  # docling can hang on malformed PDFs
 DOWNLOAD_RETRIES = 3
+# The crawler's 20 MB / 90 s caps are tuned for HTML; the prospectuses are
+# legitimately larger and slower, so raise the ceiling for PDF downloads only.
+MAX_PDF_BYTES = 150 * 1024 * 1024
+MAX_PDF_SECONDS = 300
 
 # The 9 documents verified to exist in data/logs/found_documents.txt.
 # Seven are named directly by the spec; the last two are the spec's "other two
@@ -47,7 +51,9 @@ DOCUMENTS = [
     ("graduate-prospectus-2024", "https://giki.edu.pk/wp-content/uploads/2023/11/GraduateProspectus2024.pdf"),
     ("ug-prospectus-2021", "https://giki.edu.pk/wp-content/uploads/2021/10/UG_Prospectus_2021.pdf"),
     ("policy-students-with-disabilities", "https://giki.edu.pk/wp-content/uploads/2023/09/Gik-HEC-Policy-for-Students-with-Disabilities.pdf"),
-    ("fes-advisory-handbook-student", "https://giki.edu.pk/wp-content/uploads/2024/03/FES-Advisory-handbook_StudentCopy.pdf"),
+    # FES-Advisory-handbook_StudentCopy.pdf is in the inventory but now 404s;
+    # replaced with another student-facing policy from the same verified list.
+    ("sexual-harassment-policy", "https://giki.edu.pk/wp-content/uploads/2023/09/GIK_TOR-SEXUAL-HARRASSMENT-POLICY-approved.pdf"),
 ]
 
 
@@ -85,7 +91,8 @@ def download(session: requests.Session, slug: str, url: str) -> Path | None:
     for candidate in public_url_variants(url):
         for attempt in range(1, DOWNLOAD_RETRIES + 1):
             try:
-                resp = fetch(session, candidate)
+                resp = fetch(session, candidate,
+                             max_bytes=MAX_PDF_BYTES, max_seconds=MAX_PDF_SECONDS)
                 resp.raise_for_status()
                 body = resp.content
                 if not body.startswith(b"%PDF"):
@@ -106,21 +113,41 @@ def download(session: requests.Session, slug: str, url: str) -> Path | None:
     return None
 
 
-def _parse_worker(pdf_path: str, queue: mp.Queue) -> None:
+def _parse_worker(pdf_path: str, queue: mp.Queue, use_ocr: bool = True) -> None:
     """Runs in its own process so a docling hang can be killed outright."""
     try:
         from docling.document_converter import DocumentConverter
 
-        result = DocumentConverter().convert(pdf_path)
+        if use_ocr:
+            converter = DocumentConverter()
+        else:
+            # OCR pulls in RapidOCR + HuggingFace model fetches, which deadlocked
+            # on the student handbook (worker blocked in futex with a CLOSE-WAIT
+            # socket to the HF CDN). These PDFs have a real text layer, so the
+            # OCR pass is unnecessary cost -- disable it for the fallback attempt.
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.document_converter import PdfFormatOption
+
+            options = PdfPipelineOptions()
+            options.do_ocr = False
+            # Table structure recognition is independent of OCR and must stay on:
+            # the prospectus tables are the highest-value content in these PDFs.
+            options.do_table_structure = True
+            converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+            )
+
+        result = converter.convert(pdf_path)
         queue.put(("ok", result.document.export_to_markdown()))
     except Exception as exc:  # noqa: BLE001 - report any parse failure verbatim
         queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
-def parse_pdf(pdf_path: Path, slug: str) -> str | None:
+def parse_pdf(pdf_path: Path, slug: str, use_ocr: bool = True) -> str | None:
     """Parse with docling under a hard per-document timeout."""
     queue: mp.Queue = mp.Queue()
-    proc = mp.Process(target=_parse_worker, args=(str(pdf_path), queue), daemon=True)
+    proc = mp.Process(target=_parse_worker, args=(str(pdf_path), queue, use_ocr), daemon=True)
     started = time.monotonic()
     proc.start()
     proc.join(PARSE_TIMEOUT_SECONDS)
@@ -130,8 +157,9 @@ def parse_pdf(pdf_path: Path, slug: str) -> str | None:
         proc.join(10)
         if proc.is_alive():
             proc.kill()
-        print(f"  [FAIL] {slug}: docling timed out after {PARSE_TIMEOUT_SECONDS}s", flush=True)
-        log_failure(slug, f"docling timeout after {PARSE_TIMEOUT_SECONDS}s")
+        mode = "ocr" if use_ocr else "no-ocr"
+        print(f"  [FAIL] {slug}: docling ({mode}) timed out after {PARSE_TIMEOUT_SECONDS}s", flush=True)
+        log_failure(slug, f"docling ({mode}) timeout after {PARSE_TIMEOUT_SECONDS}s")
         return None
 
     if queue.empty():
@@ -169,12 +197,22 @@ def main() -> int:
     succeeded, failed = [], []
     for slug, url in DOCUMENTS:
         print(f"[{slug}]", flush=True)
+        existing = TEXT_DIR / f"{slug}.txt"
+        if existing.exists() and len(existing.read_text(encoding="utf-8").split()) >= MIN_DOC_WORDS:
+            wc = len(existing.read_text(encoding="utf-8").split())
+            print(f"  [skip] {slug} already parsed ({wc:,} words)", flush=True)
+            succeeded.append((slug, wc))
+            continue
+
         pdf_path = download(session, slug, url)
         if pdf_path is None:
             failed.append(slug)
             continue
 
         text = parse_pdf(pdf_path, slug)
+        if text is None:
+            print(f"  [fallback] retrying {slug} with OCR disabled", flush=True)
+            text = parse_pdf(pdf_path, slug, use_ocr=False)
         if text is None:
             failed.append(slug)
             continue

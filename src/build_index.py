@@ -94,6 +94,21 @@ def count_tokens(text: str) -> int:
     return int(len(text.split()) * 1.33) + 1
 
 
+def is_table(block: str) -> bool:
+    """True for a docling Markdown table.
+
+    docling exports tables as pipe-delimited Markdown; a block counts as a table
+    when most of its lines are pipe rows. Tables are atomic downstream -- they
+    are the highest-value content in the prospectuses and a table split across
+    chunks loses the row/column association that makes it answerable at all.
+    """
+    lines = [line for line in block.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    pipe_rows = sum(1 for line in lines if line.lstrip().startswith("|"))
+    return pipe_rows >= max(2, len(lines) * 0.6)
+
+
 def split_blocks(text: str) -> list[str]:
     """Split on blank lines, keeping markdown headings attached to what follows."""
     blocks: list[str] = []
@@ -118,6 +133,42 @@ def split_oversized(block: str) -> list[str]:
     return [c for c in out if c.strip()]
 
 
+def hard_split(piece: str) -> list[str]:
+    """Last-resort word-boundary split with overlap.
+
+    Sentence splitting can't help text with no sentence punctuation -- PDF table
+    rows and personnel publication lists are single 2,000-token "sentences".
+    Without this, chunks silently blow past the 512-token target.
+    """
+    words = piece.split()
+    per_chunk = int(TARGET_TOKENS / 1.33)      # tokens -> words
+    stride = max(1, per_chunk - int(OVERLAP_TOKENS / 1.33))
+    out = []
+    for start in range(0, len(words), stride):
+        window = words[start : start + per_chunk]
+        if window:
+            out.append(" ".join(window))
+        if start + per_chunk >= len(words):
+            break
+    return out
+
+
+def enforce_cap(chunks: list[str]) -> list[str]:
+    """Cap every chunk at the target -- except tables, which stay whole.
+
+    An oversized table is deliberately allowed through: nomic-embed-text has an
+    8192-token context, so a long fee or course table still embeds intact, and
+    keeping it whole is worth more than hitting the 512 target exactly.
+    """
+    final: list[str] = []
+    for chunk in chunks:
+        if count_tokens(chunk) <= TARGET_TOKENS or is_table(chunk):
+            final.append(chunk)
+        else:
+            final.extend(hard_split(chunk))
+    return final
+
+
 def chunk_text(text: str) -> list[str]:
     """Greedily pack blocks up to TARGET_TOKENS, carrying OVERLAP_TOKENS across."""
     chunks: list[str] = []
@@ -128,6 +179,14 @@ def chunk_text(text: str) -> list[str]:
             chunks.append("\n\n".join(current))
 
     for block in split_blocks(text):
+        if is_table(block):
+            # A table is never merged with surrounding prose and never split:
+            # it becomes exactly one chunk, whatever its size.
+            flush()
+            current = []
+            chunks.append(block)
+            continue
+
         if count_tokens(block) > TARGET_TOKENS:
             flush()
             current = []
@@ -149,7 +208,7 @@ def chunk_text(text: str) -> list[str]:
             current = candidate
 
     flush()
-    return [c for c in chunks if c.strip()]
+    return [c for c in enforce_cap(chunks) if c.strip()]
 
 
 def build_chunk_records() -> list[dict]:

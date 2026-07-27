@@ -67,15 +67,24 @@ class StopCrawl(Exception):
         self.reason = reason
 
 
-def fetch(session: requests.Session, url: str) -> requests.Response:
+def fetch(
+    session: requests.Session,
+    url: str,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+    max_seconds: float = MAX_REQUEST_SECONDS,
+) -> requests.Response:
     """GET a URL under a hard wall-clock cap.
+
+    max_bytes/max_seconds default to the HTML-crawl limits; Phase 2 raises them
+    for PDF downloads, where a 20 MB prospectus is legitimate rather than a
+    runaway response.
 
     requests' `timeout` only bounds the gap between bytes, never total elapsed
     time, so a server that trickles the body (or a long redirect chain) hangs
     right past it -- this crawl stalled 15+ minutes on a single URL, twice,
     with timeout=15 set. Stream the body and abort once the cap is exceeded.
     """
-    deadline = time.monotonic() + MAX_REQUEST_SECONDS
+    deadline = time.monotonic() + max_seconds
     resp = session.get(
         url,
         timeout=(CONNECT_TIMEOUT_SECONDS, REQUEST_TIMEOUT_SECONDS),
@@ -87,12 +96,12 @@ def fetch(session: requests.Session, url: str) -> requests.Response:
         for chunk in resp.iter_content(chunk_size=65536):
             if time.monotonic() > deadline:
                 raise requests.exceptions.Timeout(
-                    f"exceeded {MAX_REQUEST_SECONDS}s wall-clock cap"
+                    f"exceeded {max_seconds}s wall-clock cap"
                 )
             total += len(chunk)
-            if total > MAX_RESPONSE_BYTES:
+            if total > max_bytes:
                 raise requests.exceptions.RequestException(
-                    f"response body exceeded {MAX_RESPONSE_BYTES} bytes"
+                    f"response body exceeded {max_bytes} bytes"
                 )
             chunks.append(chunk)
     finally:
