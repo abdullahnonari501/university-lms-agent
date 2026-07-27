@@ -67,9 +67,12 @@ editor + autocomplete only. Don't run both agents against the same repo.
   (URLs only — nothing downloaded or parsed). The file has 12,208 *lines*, but
   that's link occurrences: two footer PDFs account for 11,957 of them. Always
   `cut -f1 ... | sort -u` before quoting a count.
-  **316 of the 319 thin pages link to a PDF** — the academic calendar, fee
-  schedules and clearance rules live in those docs, not in HTML. Phase 2 must
-  ingest them or the bot can't answer the most common student questions.
+  "316 of 319 thin pages link to a PDF" is an artifact — for most of them the
+  only links are the two site-wide footer PDFs. Verified 2026-07-27: the fee,
+  degree-requirements and student-clearance pages are **empty shells** (0–8
+  words in `#kingster-page-wrapper`, no page-specific PDF, no iframe/table).
+  **No fee schedule exists anywhere on the public site.** Degree requirements
+  live in the prospectuses. Don't promise fee answers from public data.
 
 **Next**
 - [ ] Embeddings / retrieval layer
