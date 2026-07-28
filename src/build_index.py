@@ -94,11 +94,16 @@ def free_gb() -> float:
 # ---------------------------------------------------------------- chunking
 
 def count_tokens(text: str) -> int:
-    """Approximate token count. nomic-embed-text's exact tokenizer isn't exposed
-    through the Ollama API, so use the standard ~1.33 tokens/word heuristic --
-    deliberately conservative (over-estimates), so chunks land under the target
-    rather than over it."""
-    return int(len(text.split()) * 1.33) + 1
+    """Approximate token count, erring high.
+
+    The usual ~1.33 tokens/word heuristic badly under-counts this corpus: course
+    codes, formulas and pipe-heavy table rows tokenize far denser than prose.
+    One catalogue chunk estimated 1,753 tokens by word count while its 10,581
+    characters really exceeded 2,048, so Ollama rejected it outright and the
+    chunk never made it into the index. Take whichever estimate is larger --
+    over-splitting costs a little recall, under-splitting loses content entirely.
+    """
+    return max(int(len(text.split()) * 1.33), int(len(text) / 3.0)) + 1
 
 
 def is_table(block: str) -> bool:
