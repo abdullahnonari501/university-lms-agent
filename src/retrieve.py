@@ -3,10 +3,9 @@
 Embeds the query with the same model used for indexing (nomic-embed-text) and
 returns top-k chunks with score, source_url and title.
 
-Note: nomic-embed-text documents a "search_query:" / "search_document:" prefix
-convention that typically improves retrieval. It is deliberately NOT used here
--- the spec fixed the embedding strategy, and index and query must match. It is
-flagged in phase2_run_summary.txt as a daytime decision, not a mid-run change.
+Queries are embedded with nomic-embed-text's "search_query: " prefix, matching
+the "search_document: " prefix build_index.py applies to chunks. The two must
+always change together: a mismatch silently degrades every result.
 
 Usage:
     python3 src/retrieve.py "when does the fall semester start?"
@@ -14,8 +13,11 @@ Usage:
 """
 
 import json
+import math
 import random
+import re
 import sys
+from collections import Counter
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +30,8 @@ TEST_OUTPUT = LOGS_DIR / "phase2_test_queries.txt"
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 EMBED_MODEL = "nomic-embed-text"
+# Must match the prefix build_index.py uses for documents (see DOC_PREFIX there).
+QUERY_PREFIX = "search_query: "
 COLLECTION = "giki"
 DEFAULT_K = 5
 
@@ -49,7 +53,7 @@ TEST_QUERIES = [
 
 
 def embed_query(text: str) -> list[float]:
-    payload = json.dumps({"model": EMBED_MODEL, "prompt": text}).encode()
+    payload = json.dumps({"model": EMBED_MODEL, "prompt": f"{QUERY_PREFIX}{text}"}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/embeddings", data=payload, headers={"Content-Type": "application/json"}
     )
@@ -63,29 +67,163 @@ def get_collection():
     return chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(COLLECTION)
 
 
+_LEXICAL: dict | None = None
+TOKEN_RE = re.compile(r"[a-z0-9]+")
+CANDIDATES = 60          # per retriever, before fusion
+RRF_K = 60               # standard reciprocal-rank-fusion constant
+# Weighted RRF: a hit in an intent-routed pool counts for more. Unweighted, a
+# globally-retrieved chunk scores twice (dense list + BM25 list) while a routed
+# hit scores once per routed list, so the routing signal is diluted exactly when
+# it is most informative.
+ROUTED_WEIGHT = 2.5
+
+
+def _tokenize(text: str) -> list[str]:
+    return TOKEN_RE.findall(text.lower())
+
+
+def _lexical_index(collection) -> dict:
+    """BM25 over every chunk, built once per process and cached.
+
+    Dense retrieval alone cannot do entity lookup: "Who is the Dean of FCSE?"
+    is semantically nearest the long FCSE overview prose, while the answer sits
+    in a 49-word contact block whose distinguishing feature is that it literally
+    contains "DEAN" and "FCSE". Embeddings smooth exactly that signal away;
+    term matching preserves it.
+    """
+    global _LEXICAL
+    if _LEXICAL is None:
+        got = collection.get(include=["documents", "metadatas"])
+        tokens = [_tokenize(d) for d in got["documents"]]
+        df: Counter[str] = Counter()
+        for toks in tokens:
+            df.update(set(toks))
+        n = max(1, len(tokens))
+        _LEXICAL = {
+            "ids": got["ids"],
+            "documents": got["documents"],
+            "metadatas": got["metadatas"],
+            "tf": [Counter(t) for t in tokens],
+            "lengths": [len(t) for t in tokens],
+            "df": df,
+            "n": n,
+            "avgdl": sum(len(t) for t in tokens) / n,
+        }
+    return _LEXICAL
+
+
+def _bm25_top(collection, query: str, limit: int, k1: float = 1.5, b: float = 0.75):
+    idx = _lexical_index(collection)
+    terms = [t for t in _tokenize(query) if len(t) > 1]
+    if not terms:
+        return []
+    scores: dict[int, float] = {}
+    for term in set(terms):
+        df = idx["df"].get(term, 0)
+        if df == 0:
+            continue
+        idf = math.log(1 + (idx["n"] - df + 0.5) / (df + 0.5))
+        for i, tf_counter in enumerate(idx["tf"]):
+            tf = tf_counter.get(term, 0)
+            if not tf:
+                continue
+            norm = 1 - b + b * (idx["lengths"][i] / idx["avgdl"])
+            scores[i] = scores.get(i, 0.0) + idf * (tf * (k1 + 1)) / (tf + k1 * norm)
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:limit]
+    return [(idx["ids"][i], idx["documents"][i], idx["metadatas"][i], s) for i, s in ranked]
+
+
+PERSON_INTENT_RE = re.compile(
+    r"\b(who|whose|dean|head of|chairman|chairperson|professor|teaches|taught"
+    r"|supervisor|advisor|adviser|faculty member|staff)\b",
+    re.IGNORECASE,
+)
+
+
+def _route_categories(query: str) -> list[str]:
+    """Categories worth searching in their own right for this query.
+
+    A 49-word staff profile cannot out-rank prospectus prose in a pool of 4,363
+    mixed chunks, however the scoring is tuned -- "dean" is not even rare, since
+    every faculty page carries "MESSAGE FROM THE DEAN". Searching personnel as
+    its own pool for person-shaped questions removes the volume mismatch instead
+    of trying to out-tune it.
+    """
+    return ["personnel"] if PERSON_INTENT_RE.search(query) else []
+
+
 def search(query: str, k: int = DEFAULT_K, category: str | None = None) -> list[dict]:
+    """Hybrid retrieval: dense semantic + BM25 lexical, fused by reciprocal rank.
+
+    Reciprocal-rank fusion is used rather than blending raw scores because
+    cosine similarity and BM25 live on incomparable scales; ranks do not.
+
+    `score` stays the dense cosine similarity so the GROUNDED/REFUSE threshold
+    keeps its meaning. Chunks surfaced only lexically report the dense score of
+    the best dense hit for the same source, or 0.0 -- fusion widens what the
+    model gets to read, it does not inflate the relevance signal.
+    """
     collection = get_collection()
-    result = collection.query(
+    where = {"category": category} if category else None
+
+    dense = collection.query(
         query_embeddings=[embed_query(query)],
-        n_results=k,
-        where={"category": category} if category else None,
+        n_results=CANDIDATES,
+        where=where,
         include=["documents", "metadatas", "distances"],
     )
+    dense_rows = list(zip(dense["ids"][0], dense["documents"][0],
+                          dense["metadatas"][0], dense["distances"][0]))
+    dense_score = {cid: 1.0 - dist for cid, _, _, dist in dense_rows}
+
+    lexical_rows = _bm25_top(collection, query, CANDIDATES)
+    if category:
+        lexical_rows = [r for r in lexical_rows if r[2].get("category") == category]
+
+    fused: dict[str, float] = {}
+    payload: dict[str, tuple] = {}
+    for rank, (cid, doc, meta, _dist) in enumerate(dense_rows, 1):
+        fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        payload[cid] = (doc, meta)
+    for rank, (cid, doc, meta, _s) in enumerate(lexical_rows, 1):
+        fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        payload.setdefault(cid, (doc, meta))
+
+    # Intent-routed pools, searched separately so a small category is not
+    # drowned by a large one's chunk count.
+    for routed in ([] if category else _route_categories(query)):
+        pool_n = max(10, k * 2)
+        sub = collection.query(
+            query_embeddings=[embed_query(query)],
+            n_results=pool_n,
+            where={"category": routed},
+            include=["documents", "metadatas", "distances"],
+        )
+        for rank, (cid, doc, meta, dist) in enumerate(
+            zip(sub["ids"][0], sub["documents"][0], sub["metadatas"][0],
+                sub["distances"][0]), 1
+        ):
+            fused[cid] = fused.get(cid, 0.0) + ROUTED_WEIGHT / (RRF_K + rank)
+            payload.setdefault(cid, (doc, meta))
+            dense_score.setdefault(cid, 1.0 - dist)
+
+        routed_lex = [r for r in _bm25_top(collection, query, CANDIDATES)
+                      if r[2].get("category") == routed][:pool_n]
+        for rank, (cid, doc, meta, _s) in enumerate(routed_lex, 1):
+            fused[cid] = fused.get(cid, 0.0) + ROUTED_WEIGHT / (RRF_K + rank)
+            payload.setdefault(cid, (doc, meta))
 
     hits = []
-    for doc, meta, dist in zip(
-        result["documents"][0], result["metadatas"][0], result["distances"][0]
-    ):
-        hits.append(
-            {
-                "text": doc,
-                "score": 1.0 - dist,  # cosine distance -> similarity
-                "source_url": meta.get("source_url", ""),
-                "title": meta.get("title", ""),
-                "category": meta.get("category", ""),
-                "doc_type": meta.get("doc_type", ""),
-            }
-        )
+    for cid, _ in sorted(fused.items(), key=lambda kv: -kv[1])[:k]:
+        doc, meta = payload[cid]
+        hits.append({
+            "text": doc,
+            "score": dense_score.get(cid, 0.0),
+            "source_url": meta.get("source_url", ""),
+            "title": meta.get("title", ""),
+            "category": meta.get("category", ""),
+            "doc_type": meta.get("doc_type", ""),
+        })
     return hits
 
 

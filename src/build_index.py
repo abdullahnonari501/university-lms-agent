@@ -36,6 +36,13 @@ NEAR_STOP_LOG = LOGS_DIR / "phase2_near_stops.txt"
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 EMBED_MODEL = "nomic-embed-text"
+# nomic-embed-text is trained with task prefixes: documents are embedded as
+# "search_document: ..." and queries as "search_query: ...". Without them the
+# model treats a question and a short factual page as the same kind of text,
+# and asymmetric retrieval suffers -- the Dean's 49-word contact block did not
+# reach the top 40 for "Who is the Dean of FCSE?". The prefix is applied only
+# to the embedding input; the stored document text stays clean.
+DOC_PREFIX = "search_document: "
 EMBED_DIM = 768
 
 TARGET_TOKENS = 512
@@ -359,7 +366,7 @@ def build_chunk_records() -> list[dict]:
 # --------------------------------------------------------------- embedding
 
 def embed_one(text: str, timeout: int = 120) -> list[float]:
-    payload = json.dumps({"model": EMBED_MODEL, "prompt": text}).encode()
+    payload = json.dumps({"model": EMBED_MODEL, "prompt": f"{DOC_PREFIX}{text}"}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/embeddings", data=payload, headers={"Content-Type": "application/json"}
     )

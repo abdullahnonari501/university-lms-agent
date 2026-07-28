@@ -50,7 +50,17 @@ GENERAL_FLAG = "⚠ Not from GIKI's website — general knowledge:"
 
 SYSTEM_GROUNDED = """You are a helpful assistant for students of GIK Institute (GIKI), Pakistan.
 
-Answer the question using ONLY the numbered sources provided. Rules:
+Answer the question using ONLY the numbered sources provided.
+
+BEFORE answering a "who holds this role" question, check every source for dates:
+a source saying "served as X from 2019 to 2023" describes a FORMER holder, not
+the current one. Never write "is the Dean" about someone whose source gives an
+end date. If one source states the role with no end date and another gives a
+past range, the one with no end date is current and the other is a predecessor
+-- name both and say which is which. Never state a role as current and then
+quote an end date for it in the same answer.
+
+Other rules:
 - Use only facts present in the sources. Never add facts from your own knowledge.
 - When you quote any number from a table, state its qualifiers from the row
   label and column heading: the unit, the period, and the category. Write
@@ -60,8 +70,7 @@ Answer the question using ONLY the numbered sources provided. Rules:
   No preamble and no padding, but do not omit facts the question asked for.
 - Refer to sources inline as [1], [2] where relevant.
 - Never invent a URL.
-- Never state a person's name unless that exact name appears in the sources. If
-  a source mentions a role but names nobody, say the sources do not name them."""
+- Never state a person's name unless that exact name appears in the sources."""
 
 SYSTEM_GENERAL = """You are a helpful assistant. Answer the question from your own general
 knowledge, concisely and accurately.
@@ -189,7 +198,15 @@ def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
             break
 
     if header_seen:
-        body = "\n".join(lines[consumed:]).strip()
+        rest = lines[consumed:]
+        # The model sometimes repeats the header after the --- separator. Strip
+        # any stray header lines rather than leaking them into the answer.
+        while rest and (
+            rest[0].strip().upper().startswith(("ANSWERED:", "SOURCES_USED:"))
+            or rest[0].strip() in {"---", ""}
+        ):
+            rest.pop(0)
+        body = "\n".join(rest).strip()
 
     # Validate: a cited URL must be one we actually retrieved. Anything the
     # model names outside that set is dropped, so it can never introduce a URL.
@@ -252,9 +269,12 @@ def unsupported_claims(body: str, hits: list[dict]) -> list[str]:
                  if len(p) > 2 and p.lower().strip(".") not in NAME_NOISE]
         if not parts:
             continue
-        # Require the surname itself to appear. Matching on *any* part is far
-        # too lenient for names built from common given names.
-        if parts[-1].lower().strip(".,") not in normalised:
+        # Require the surname itself to appear, on a word boundary. Plain
+        # substring matching let "Dr. Umar Haq" through because "haq" sits
+        # inside "Ghulam Ishaq Khan Institute", which appears in nearly every
+        # chunk -- so any name ending in Haq looked supported.
+        surname = re.escape(parts[-1].lower().strip(".,"))
+        if not re.search(rf"\b{surname}\b", normalised):
             bad.append(name)
 
     for number in NUMBER_PATTERN.findall(body):
@@ -262,6 +282,75 @@ def unsupported_claims(body: str, hits: list[dict]) -> list[str]:
             bad.append(number)
 
     return bad
+
+
+RERANK_POOL = 20        # candidates pulled before reranking
+RERANK_KEEP = 12        # candidates actually shown to the reranker
+
+RERANK_PROMPT = """Rank the numbered passages by how directly they answer the question.
+
+Question: {question}
+
+{passages}
+
+Reply with only the passage numbers, best first, comma separated. Include just
+the ones that genuinely help; omit the rest. Example: 3, 1, 7
+
+Answer:"""
+
+
+def dedupe_by_source(hits: list[dict]) -> list[dict]:
+    """Keep the best chunk per source page.
+
+    Several chunks from one long page otherwise occupy most of the top-k --
+    on "Who is the Dean", one person's profile held ranks 2, 5 and 7, pushing
+    the page that actually names the Dean out of contention.
+    """
+    seen: set[str] = set()
+    out = []
+    for hit in hits:
+        key = hit.get("source_url", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+    return out
+
+
+def rerank(question: str, hits: list[dict], model: str) -> list[dict]:
+    """Reorder candidates by asking the model which actually answer the question.
+
+    Similarity ranks passages by topical closeness, which is not the same as
+    containing the answer: for "Who is the Dean of FCSE?" every FCSE page and
+    every staff profile is topically close, while exactly one says "DEAN" next
+    to a name. A reranker reads the candidates and judges that directly.
+
+    Falls back to the original order on any failure -- reranking is an
+    improvement, never a dependency.
+    """
+    if len(hits) < 2:
+        return hits
+    passages = "\n\n".join(
+        f"[{i}] {' '.join(h['text'].split())[:400]}" for i, h in enumerate(hits, 1)
+    )
+    try:
+        raw = call_qwen(model, "", RERANK_PROMPT.format(question=question, passages=passages),
+                        timeout=180)
+    except Exception:  # noqa: BLE001
+        return hits
+
+    order = [int(n) for n in re.findall(r"\d+", raw) if 1 <= int(n) <= len(hits)]
+    if not order:
+        return hits
+    seen: set[int] = set()
+    ranked = []
+    for n in order:
+        if n not in seen:
+            seen.add(n)
+            ranked.append(hits[n - 1])
+    # Anything the reranker omitted keeps its original relative order at the back.
+    ranked.extend(h for i, h in enumerate(hits, 1) if i not in seen)
+    return ranked
 
 
 def build_grounded_prompt(question: str, hits: list[dict]) -> str:
@@ -289,8 +378,12 @@ def build_grounded_prompt(question: str, hits: list[dict]) -> str:
 def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
            threshold: float = RELEVANCE_THRESHOLD) -> Answer:
     started = time.monotonic()
-    hits = search(question, k=k)
-    top = hits[0]["score"] if hits else 0.0
+    # Pull a wider pool, drop duplicate pages, then let the reranker decide the
+    # order. The relevance threshold still uses the best dense score in the
+    # pool, so reranking changes what is read, never how confident we are.
+    pool = search(question, k=RERANK_POOL)
+    top = max((h["score"] for h in pool), default=0.0)
+    hits = rerank(question, dedupe_by_source(pool)[:RERANK_KEEP], model)[:k]
 
     if hits and top >= threshold:
         kept = fit_chunks(hits)
