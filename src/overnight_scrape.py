@@ -11,7 +11,7 @@ import json
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -30,7 +30,38 @@ CONNECT_TIMEOUT_SECONDS = 10
 MAX_REQUEST_SECONDS = 90  # hard wall-clock cap per request, see fetch()
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 MAX_REDIRECTS = 5
-MIN_WORD_COUNT = 100
+# Word count is a poor proxy for value: the FCSE Dean's page is 49 words, the
+# academic calendar 3, student clearance 8 -- all real content that a 100-word
+# floor threw away. Keep only a floor low enough to drop genuinely empty pages,
+# and kill junk by identity instead (see THEME_DEMO_RE / is_boilerplate).
+MIN_WORD_COUNT = 10
+
+# WordPress theme demo pages shipped with the Kingster theme. These are
+# template samples, not GIKI content, and must stay excluded however long they
+# are.
+THEME_DEMO_RE = re.compile(
+    r"/(?:portfolio|blog|gallery)-"
+    r"|/(?:shop|cart|checkout|my-account|woocommerce-page|coming-soon"
+    r"|maintenance|demo|try-page|testimonials|sample-page)/?$",
+    re.IGNORECASE,
+)
+
+
+def is_theme_demo(url: str) -> bool:
+    return bool(THEME_DEMO_RE.search(url))
+
+
+def is_boilerplate(text: str, common_lines: set[str], threshold: float = 0.9) -> bool:
+    """True when a page is almost entirely lines seen across the rest of the site.
+
+    Catches shells whose only text is menu/footer residue, without needing a
+    word-count rule that also discards short-but-real pages.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return True
+    shared = sum(1 for line in lines if line in common_lines)
+    return shared / len(lines) >= threshold
 MAX_DATA_BYTES = 500 * 1024 * 1024
 MAX_FAILURE_RATE = 0.15
 MIN_ATTEMPTS_BEFORE_RATE_CHECK = 20
@@ -201,6 +232,13 @@ def process_url(
 ) -> int | None:
     """Fetch, extract, save or skip one URL. Returns the HTTP status code
     (or None if the request never got a response)."""
+    if is_theme_demo(url):
+        # Kingster theme sample pages. Excluded by identity, not by length --
+        # several are long enough to pass any word-count rule.
+        stats["theme_demo_skipped"] = stats.get("theme_demo_skipped", 0) + 1
+        append_line(SKIPPED_LOG, f"{url}\t{category}\ttheme-demo page")
+        return None
+
     if not robots.can_fetch(USER_AGENT, url):
         stats["robots_skipped"] += 1
         return None
@@ -282,6 +320,48 @@ def check_stop_conditions(status: int | None, stats: dict) -> None:
         du = dir_size_bytes(DATA_DIR)
         if du > MAX_DATA_BYTES:
             raise StopCrawl(f"data/ exceeds 500MB ({du / 1e6:.1f} MB)")
+
+
+def prune_boilerplate_pages(manifest: list[dict], stats: dict, min_share: float = 0.3) -> None:
+    """Drop pages that are nothing but text repeated across the rest of the site.
+
+    Run as a second pass rather than during the crawl: "shared with the rest of
+    the corpus" is only meaningful once the corpus exists, and judging it
+    mid-crawl would make the outcome depend on visit order.
+
+    This is the safety net for junk that is neither a known theme-demo URL nor
+    short enough to fail the word floor.
+    """
+    counts: Counter[str] = Counter()
+    pages: list[tuple[dict, list[str]]] = []
+    for entry in manifest:
+        path = RAW_DIR / entry["category"] / f"{entry['slug']}.txt"
+        if not path.exists():
+            continue
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+                 if line.strip()]
+        pages.append((entry, lines))
+        counts.update(set(lines))
+
+    if not pages:
+        return
+    common = {line for line, n in counts.items() if n / len(pages) >= min_share}
+
+    removed = 0
+    for entry, lines in pages:
+        if not lines:
+            continue
+        if sum(1 for line in lines if line in common) / len(lines) >= 0.9:
+            (RAW_DIR / entry["category"] / f"{entry['slug']}.txt").unlink(missing_ok=True)
+            manifest.remove(entry)
+            append_line(SKIPPED_LOG, f"{entry['url']}\t{entry['category']}\tboilerplate only")
+            removed += 1
+
+    stats["boilerplate_pruned"] = removed
+    if removed:
+        MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Boilerplate pass: {removed} page(s) removed "
+          f"({len(common)} shared lines across {len(pages)} pages)", flush=True)
 
 
 def write_run_summary(stats: dict, url_list: list[tuple[str, str]], start_time: float) -> None:
@@ -409,6 +489,7 @@ def main() -> None:
         print(f"\nSTOP condition triggered: {e.reason}")
 
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    prune_boilerplate_pages(manifest, stats)
     write_run_summary(stats, url_list, start_time)
 
 

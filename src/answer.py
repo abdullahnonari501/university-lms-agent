@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from retrieve import search  # noqa: E402
 
 OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "qwen2.5vl:7b-q4_K_M"
+DEFAULT_MODEL = "qwen2.5:7b"  # Malik's pick: faster, lighter, more concise than the VL model
 
 # Measured on this box, not taken from the model card. `ollama show` reports a
 # 128000 context; the server actually allocated n_ctx_slot = 4096 by default.
