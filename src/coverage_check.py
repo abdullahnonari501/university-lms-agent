@@ -9,6 +9,7 @@ Writes data/logs/coverage_report.txt and prints a summary.
 """
 
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -56,13 +57,21 @@ def main() -> int:
 
     missing = [(u, c) for u, c in targets if u not in in_corpus]
     by_reason: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    # Bucket by cause, not by the exact log message -- grouping on the word count
+    # produced ~80 one-line buckets that hid the actual shape of the gap.
+    theme_demo = re.compile(
+        r"/(portfolio|blog|gallery)-|/(shop|cart|checkout|my-account|woocommerce-page"
+        r"|coming-soon|maintenance|demo|try-page|testimonials)/?$"
+    )
     for url, cat in missing:
         if url in thin:
-            by_reason[f"thin page (<100 words): {thin[url]}"].append((url, cat))
+            bucket = ("thin: WordPress theme demo page (no real content)"
+                      if theme_demo.search(url) else "thin: real page under 100 words")
+            by_reason[bucket].append((url, cat, thin[url]))
         elif url in failed:
-            by_reason["fetch failed"].append((url, cat))
+            by_reason["fetch failed"].append((url, cat, failed[url][:70]))
         else:
-            by_reason["UNEXPLAINED -- not thin, not failed"].append((url, cat))
+            by_reason["UNEXPLAINED -- not thin, not failed"].append((url, cat, ""))
 
     # (b) where structured content landed
     tabled = []
@@ -98,8 +107,8 @@ def main() -> int:
         items = by_reason[reason]
         a("")
         a(f"  {reason}  [{len(items)} URLs]")
-        for url, cat in items[:40]:
-            a(f"    {cat:<11} {url}")
+        for url, cat, note in items[:40]:
+            a(f"    {cat:<11} {url}  ({note})" if note else f"    {cat:<11} {url}")
         if len(items) > 40:
             a(f"    ... and {len(items) - 40} more")
     a("")

@@ -68,16 +68,19 @@ editor + autocomplete only. Don't run both agents against the same repo.
   that's link occurrences: two footer PDFs account for 11,957 of them. Always
   `cut -f1 ... | sort -u` before quoting a count.
   "316 of 319 thin pages link to a PDF" is an artifact — for most of them the
-  only links are the two site-wide footer PDFs. Verified 2026-07-27: the fee,
-  degree-requirements and student-clearance pages are **empty shells** (0–8
-  words in `#kingster-page-wrapper`, no page-specific PDF, no iframe/table).
-  **No fee schedule exists anywhere on the public site.** Degree requirements
-  live in the prospectuses. Don't promise fee answers from public data.
+  only links are the two site-wide footer PDFs. The `/fee/*` pages really are
+  empty shells (0–8 words, no page-specific PDF).
+  **But fee data DOES exist** — at `/admissions/admissions-undergraduates/
+  ugrad-fees-and-expenses/` and its `/admissions-graduate/` twin, both in the
+  corpus with their tables intact. An earlier note here claimed no fee schedule
+  existed anywhere; that was inferred from the empty `/fee/*` pages plus no fee
+  PDF, and it was simply wrong. Check every path before declaring data absent.
 
-- **Phase 2 retrieval layer complete** (2026-07-28) — **3,682 chunks** in
+- **Phase 2 retrieval layer complete** (2026-07-28) — **4,210 chunks** in
   chromadb (`data/chroma`, collection `giki`, cosine), embedded with
   `nomic-embed-text` (768-dim) via Ollama. 0 embedding failures. Chunks are
-  512-token target / 64 overlap; **tables are atomic** (66 kept whole).
+  512-token target / 64 overlap; **tables preserved** (756 pages, 9,638 rows) —
+  whole under 1,800 tokens, else split on row boundaries with header repeated.
   All 9 verified PDFs parsed with docling (145k words added) — handbook,
   academic calendar, both prospectuses, transport + admissions + disabilities +
   harassment policies. Query with `src/retrieve.py "..."`.
