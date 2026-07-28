@@ -66,6 +66,70 @@ def slugify(url: str) -> str:
     return slug or "index"
 
 
+def table_to_markdown(table) -> str:
+    """Render an HTML <table> as a Markdown table.
+
+    get_text() flattens a table into a bare column of values, destroying the
+    row/column association -- the fee page became four headers followed by four
+    unlabelled numbers, with nothing tying Rs. 470,000 to "Engineering, per
+    semester". Tables are the highest-value content on pages like fees and
+    course breakdowns, so they must keep their shape.
+    """
+    def span_of(cell, attr: str) -> int:
+        try:
+            return max(1, int(cell.get(attr, 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    # Lay the table out on a grid honouring both colspan and rowspan. Without
+    # this the fee table's sub-headers slide left: "Engineering & Computing"
+    # lands under "S/No." rather than under "Semester Fee", which inverts what
+    # every number in the row means.
+    rows: list[list[str]] = []
+    carry: dict[int, tuple[str, int]] = {}  # column -> (text, rows remaining)
+
+    for tr in table.find_all("tr"):
+        cells = tr.find_all(["td", "th"])
+        if not cells:
+            continue
+        row: list[str] = []
+        col = 0
+        pos = 0
+        while pos < len(cells) or col in carry:
+            if col in carry:
+                text, left = carry[col]
+                row.append(text)
+                if left <= 1:
+                    del carry[col]
+                else:
+                    carry[col] = (text, left - 1)
+                col += 1
+                continue
+
+            cell = cells[pos]
+            pos += 1
+            text = " ".join(cell.get_text(" ").split())
+            for i in range(span_of(cell, "colspan")):
+                row.append(text if i == 0 else "")
+                rowspan = span_of(cell, "rowspan")
+                if rowspan > 1:
+                    carry[col] = (text if i == 0 else "", rowspan - 1)
+                col += 1
+
+        if any(row):
+            rows.append(row)
+
+    if not rows:
+        return ""
+
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    out = ["| " + " | ".join(rows[0]) + " |",
+           "|" + "|".join(["---"] * width) + "|"]
+    out += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return "\n".join(out)
+
+
 def extract_title_and_text(soup: BeautifulSoup) -> tuple[str, str]:
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
@@ -79,6 +143,12 @@ def extract_title_and_text(soup: BeautifulSoup) -> tuple[str, str]:
 
     for tag in content(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
         tag.decompose()
+
+    # Swap each table for its Markdown rendering before the text is flattened,
+    # so the row/column structure survives into the corpus.
+    for table in content.find_all("table"):
+        markdown = table_to_markdown(table)
+        table.replace_with(f"\n\n{markdown}\n\n" if markdown else "")
 
     text = content.get_text(separator="\n")
     lines = [line.strip() for line in text.splitlines()]

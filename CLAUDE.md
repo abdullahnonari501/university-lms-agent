@@ -120,8 +120,16 @@ turn out to be JavaScript-rendered.
   PDF over ~16k words "hung", every small one worked. Hand back a temp-file path.
 - Pin `OMP_NUM_THREADS=1` (+ MKL/OPENBLAS) for docling, and set
   `HF_HUB_OFFLINE=1` — docling phones HuggingFace even with weights cached.
-- **There is no fee data anywhere on the public site.** Not in HTML, not in any
-  of the 130 PDFs. The bot must refuse fee questions, not improvise.
+- **Fee data DOES exist** — at `/admissions/admissions-undergraduates/
+  ugrad-fees-and-expenses/` and the `/admissions-graduate/` equivalent, already
+  in the corpus. (An earlier note here claimed otherwise: that was inferred from
+  the empty `/fee/*` pages plus no fee PDF, and it was wrong. Check every path
+  before declaring data absent.)
+- **HTML tables were being flattened** by `get_text()` — the fee page became
+  four headers followed by four unlabelled numbers, losing which figure was
+  Engineering-per-semester. `table_to_markdown()` in `scraper.py` now renders
+  tables as Markdown honouring colspan *and* rowspan. Any corpus extracted
+  before 2026-07-28 has flattened tables and must be re-scraped.
 
 **Open question:** the GIKI LMS itself is behind a login. The public website is
 scrapeable; the authenticated LMS is not, without institutional permission. Decide
