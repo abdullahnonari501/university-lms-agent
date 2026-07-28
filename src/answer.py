@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -61,13 +62,19 @@ SYSTEM_GROUNDED = """You are a helpful assistant for students of GIK Institute (
 
 Answer the question using ONLY the numbered sources provided.
 
-BEFORE answering a "who holds this role" question, check every source for dates:
-a source saying "served as X from 2019 to 2023" describes a FORMER holder, not
-the current one. Never write "is the Dean" about someone whose source gives an
-end date. If one source states the role with no end date and another gives a
-past range, the one with no end date is current and the other is a predecessor
--- name both and say which is which. Never state a role as current and then
-quote an end date for it in the same answer.
+Every source carries a CURRENCY line. Obey it:
+- A source marked "may be superseded" is older. If a newer source or a live
+  undated page gives a different figure for the same thing, use the newer one.
+- If your answer relies on a dated source, say so in the answer: "As of the 2021
+  prospectus, ...". Never present an old figure as if it were current.
+- If a source carries a WARNING about an ENDED term, that person is a FORMER
+  holder. Never write "X is the Dean" about them. Say "X served as Dean from
+  2019 to 2023". If no source names a current holder, say the sources do not
+  name the current one rather than offering a predecessor as the answer.
+
+The CURRENCY lines are internal notes for you. Never mention them, never write
+"according to the WARNING" or "the CURRENCY line says" -- state the fact itself
+("Dr. X served as Dean from 2019 to 2023").
 
 Other rules:
 - Use only facts present in the sources. Never add facts from your own knowledge.
@@ -373,10 +380,66 @@ def rerank(question: str, hits: list[dict], model: str) -> list[dict]:
     return ranked
 
 
+CURRENT_YEAR = datetime.now(timezone.utc).year
+# "Dean, 2019-2023", "served 2019 to 2023", "(September 2019 to August 2023)"
+# A month may sit between the years -- the real case reads "September 2019 to
+# August 2023", which a bare "YYYY to YYYY" pattern silently missed.
+PAST_TERM_RE = re.compile(
+    r"((?:19|20)\d{2})\s*(?:[-\u2013]|to|until|through)\s*"
+    r"(?:[A-Za-z]+\s+)?((?:19|20)\d{2})",
+    re.IGNORECASE,
+)
+ROLE_WORDS = ("dean", "head", "chair", "director", "rector", "president",
+              "coordinator", "in charge", "incharge")
+
+
+def ended_terms(text: str) -> list[str]:
+    """Date ranges in the text that describe a role and have already ended.
+
+    This is the Ahmar Rashid case: his profile is a live, undated page, so
+    source-date metadata cannot help -- the staleness is *inside* the text
+    ("Dean FCSE, September 2019 to August 2023"). Surfacing it as an explicit
+    note beats asking the model to notice it, which three prompt rewrites
+    failed to achieve.
+    """
+    found = []
+    for match in PAST_TERM_RE.finditer(text):
+        end_year = int(match.group(2))
+        if end_year >= CURRENT_YEAR:
+            continue
+        window = text[max(0, match.start() - 120): match.end() + 40].lower()
+        if any(word in window for word in ROLE_WORDS):
+            found.append(f"{match.group(1)}-{match.group(2)}")
+    return found
+
+
+def source_note(hit: dict) -> str:
+    """One line telling the model how current this source is."""
+    bits = []
+    if hit.get("source_date"):
+        bits.append(f"published {hit['source_date']}")
+        if int(hit["source_date"]) < CURRENT_YEAR:
+            bits.append(f"{CURRENT_YEAR - int(hit['source_date'])} year(s) old — "
+                        "may be superseded")
+    else:
+        bits.append("live website page, undated — reflects current information")
+
+    ended = ended_terms(hit.get("text", ""))
+    if ended:
+        bits.append(
+            "WARNING: mentions a role with an ENDED term (" + ", ".join(ended)
+            + ") — that person is a FORMER holder, not the current one"
+        )
+    return "; ".join(bits)
+
+
 def build_grounded_prompt(question: str, hits: list[dict]) -> str:
     parts = []
     for i, hit in enumerate(hits, 1):
-        parts.append(f"[{i}] {hit['title']}\nURL: {hit['source_url']}\n{hit['text']}")
+        parts.append(
+            f"[{i}] {hit['title']}\nURL: {hit['source_url']}\n"
+            f"CURRENCY: {source_note(hit)}\n{hit['text']}"
+        )
     # The output-format contract is repeated here, after the sources, because
     # this 7B model dropped it entirely when it lived only in the system prompt.
     return (
@@ -398,6 +461,7 @@ def build_grounded_prompt(question: str, hits: list[dict]) -> str:
 def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
            threshold: float = RELEVANCE_THRESHOLD) -> Answer:
     started = time.monotonic()
+    not_found_reason = ""
     # Pull a wider pool, drop duplicate pages, then let the reranker decide the
     # order. The relevance threshold still uses the best dense score in the
     # pool, so reranking changes what is read, never how confident we are.
@@ -429,17 +493,28 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
         # Retrieval was topically close but held no answer. Treat that exactly
         # like a below-threshold miss and let the classifier decide, so
         # "how do I improve my CGPA" can still fall to GENERAL rather than
-        # dead-ending in a refusal.
+        # dead-ending in a refusal. Keep the model's explanation: when it
+        # declines because a source shows only a FORMER office-holder, saying
+        # so is far more use to a student than boilerplate.
+        # The explanation is model-generated prose and must clear the same
+        # fabrication bar as an answer -- passing it through unchecked let an
+        # invented name ("Ehtisham ul Haq") reach the user inside a refusal,
+        # which is the one place nobody would think to look for one.
+        not_found_reason = "" if unsupported_claims(body, kept) else body
 
     if classify_question(model, question) == "GENERIC":
         text = call_qwen(model, SYSTEM_GENERAL, question)
         return Answer("GENERAL", f"{GENERAL_FLAG}\n\n{text}", [], top,
                       time.monotonic() - started, 0, model)
 
-    text = (
+    preamble = (
+        f"{not_found_reason}\n\n" if not_found_reason else
         "I couldn't find this on GIK Institute's public website, so I don't want "
         "to guess — an invented fee, date or policy would be worse than no answer.\n\n"
-        "Please check with the source that owns this information:\n"
+    )
+    text = (
+        preamble +
+        "For the current answer, check with the source that owns this information:\n"
         "  • Admissions Office — admissions@giki.edu.pk\n"
         "  • Student Affairs (hostel, transport, clearance) — via giki.edu.pk/contact-us/\n"
         "  • Your academic advisor or the relevant faculty office"

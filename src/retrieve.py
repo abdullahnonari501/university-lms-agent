@@ -223,6 +223,8 @@ def search(query: str, k: int = DEFAULT_K, category: str | None = None) -> list[
             "title": meta.get("title", ""),
             "category": meta.get("category", ""),
             "doc_type": meta.get("doc_type", ""),
+            "source_date": meta.get("source_date", ""),
+            "date_basis": meta.get("date_basis", ""),
         })
     return hits
 

@@ -98,6 +98,43 @@ def free_gb() -> float:
     return shutil.disk_usage(REPO_ROOT).free / 1e9
 
 
+# ------------------------------------------------------------ source dates
+
+# Year range like "2023-24" or "2025-2026": the later year is what the document
+# is current for.
+YEAR_RANGE_RE = re.compile(r"(20\d{2})\s*[-\u2013]\s*(\d{2,4})")
+YEAR_RE = re.compile(r"(20\d{2})")
+# WordPress upload paths are reliably /uploads/YYYY/MM/ and give a document's
+# publication date even when its filename carries no year.
+UPLOAD_PATH_RE = re.compile(r"/uploads/(20\d{2})/(\d{2})/")
+
+
+def extract_source_date(url: str, slug: str) -> tuple[str | None, str]:
+    """Best-effort publication date for a source. Returns (date, how_we_knew).
+
+    Live site pages carry no date and are treated as undated, which downstream
+    means "current" -- the site shows what is true now. Documents are the
+    opposite: a 2021 prospectus stays 2021 forever, which is exactly how a fee
+    from it came to be quoted over the current one.
+    """
+    haystack = f"{url} {slug}"
+
+    match = YEAR_RANGE_RE.search(haystack)
+    if match:
+        start, end = match.group(1), match.group(2)
+        end_year = end if len(end) == 4 else start[:2] + end
+        return end_year, "year range in name"
+
+    upload = UPLOAD_PATH_RE.search(url)
+    filename = url.rsplit("/", 1)[-1]
+    year_in_name = YEAR_RE.search(filename)
+    if year_in_name:
+        return year_in_name.group(1), "year in filename"
+    if upload:
+        return upload.group(1), "upload path"
+    return None, "undated (live site page)"
+
+
 # ---------------------------------------------------------------- chunking
 
 def count_tokens(text: str) -> int:
@@ -339,6 +376,7 @@ def build_chunk_records() -> list[dict]:
             continue
 
         text = path.read_text(encoding="utf-8")
+        source_date, date_basis = extract_source_date(entry["url"], slug)
         pieces = chunk_text(text)
         for i, piece in enumerate(pieces):
             records.append(
@@ -354,6 +392,8 @@ def build_chunk_records() -> list[dict]:
                         "n_chunks": len(pieces),
                         "source_file": str(path.relative_to(REPO_ROOT)),
                         "scraped_at": entry.get("scraped_at", ""),
+                        "source_date": source_date or "",
+                        "date_basis": date_basis,
                     },
                 }
             )
