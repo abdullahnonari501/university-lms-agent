@@ -40,6 +40,10 @@ EMBED_DIM = 768
 
 TARGET_TOKENS = 512
 OVERLAP_TOKENS = 64
+# Tables stay whole up to this size; beyond it they split on row boundaries with
+# the header repeated. Sits well under nomic-embed-text's 8192-token context so
+# no table chunk is ever silently truncated at embed time.
+TABLE_MAX_TOKENS = 3000
 BATCH_SIZE = 32
 COLLECTION = "giki"
 
@@ -153,6 +157,80 @@ def hard_split(piece: str) -> list[str]:
     return out
 
 
+def pack_pieces(pieces: list[str]) -> list[str]:
+    """Greedily recombine small sub-tables so we don't emit hundreds of tiny
+    chunks, without ever exceeding the table budget."""
+    out: list[str] = []
+    current: list[str] = []
+    for piece in pieces:
+        candidate = current + [piece]
+        if current and count_tokens("\n\n".join(candidate)) > TABLE_MAX_TOKENS:
+            out.append("\n\n".join(current))
+            current = [piece]
+        else:
+            current = candidate
+    if current:
+        out.append("\n\n".join(current))
+    return out
+
+
+def split_table_rows(block: str) -> list[str]:
+    """Split an oversized Markdown table on row boundaries, repeating the header.
+
+    Keeping a table whole beats splitting it -- but only while it still fits the
+    embedding model. nomic-embed-text truncates at 8192 tokens, so a 142k-token
+    course catalogue would have ~94% of its rows silently dropped and
+    unsearchable. Splitting between rows and repeating the header keeps every
+    row's column meaning intact, which is the property that actually matters.
+    """
+    # A run of tables with no blank line between them arrives as one block --
+    # the course catalogue is dozens of per-course CLO grids concatenated. Split
+    # at each separator row first, so every sub-table keeps its own header
+    # instead of inheriting the first one in the page.
+    lines = block.splitlines()
+    seps = [
+        i for i, line in enumerate(lines)
+        if line.lstrip().startswith("|") and set(line.replace("|", "").strip()) <= {"-", " "}
+        and line.strip()
+    ]
+    if len(seps) > 1:
+        starts = [max(0, s - 1) for s in seps]
+        if starts[0] > 0:
+            starts.insert(0, 0)
+        pieces: list[str] = []
+        for n, start in enumerate(starts):
+            end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+            sub = "\n".join(lines[start:end]).strip()
+            if sub:
+                pieces.extend(split_table_rows(sub))
+        return pack_pieces(pieces)
+
+    header: list[str] = []
+    body_start = 0
+    if lines and lines[0].lstrip().startswith("|"):
+        header = [lines[0]]
+        body_start = 1
+        if len(lines) > 1 and set(lines[1].replace("|", "").strip()) <= {"-", " "}:
+            header.append(lines[1])
+            body_start = 2
+
+    header_tokens = count_tokens("\n".join(header))
+    parts: list[str] = []
+    current: list[str] = []
+
+    for line in lines[body_start:]:
+        candidate = current + [line]
+        if header_tokens + count_tokens("\n".join(candidate)) > TABLE_MAX_TOKENS and current:
+            parts.append("\n".join(header + current))
+            current = [line]
+        else:
+            current = candidate
+
+    if current:
+        parts.append("\n".join(header + current))
+    return parts or [block]
+
+
 def enforce_cap(chunks: list[str]) -> list[str]:
     """Cap every chunk at the target -- except tables, which stay whole.
 
@@ -162,7 +240,14 @@ def enforce_cap(chunks: list[str]) -> list[str]:
     """
     final: list[str] = []
     for chunk in chunks:
-        if count_tokens(chunk) <= TARGET_TOKENS or is_table(chunk):
+        if is_table(chunk):
+            # Whole if it fits the embedder; otherwise split between rows,
+            # never mid-row, with the header carried into each part.
+            if count_tokens(chunk) <= TABLE_MAX_TOKENS:
+                final.append(chunk)
+            else:
+                final.extend(split_table_rows(chunk))
+        elif count_tokens(chunk) <= TARGET_TOKENS:
             final.append(chunk)
         else:
             final.extend(hard_split(chunk))
