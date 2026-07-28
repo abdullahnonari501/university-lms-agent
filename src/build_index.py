@@ -41,9 +41,12 @@ EMBED_DIM = 768
 TARGET_TOKENS = 512
 OVERLAP_TOKENS = 64
 # Tables stay whole up to this size; beyond it they split on row boundaries with
-# the header repeated. Sits well under nomic-embed-text's 8192-token context so
-# no table chunk is ever silently truncated at embed time.
-TABLE_MAX_TOKENS = 3000
+# the header repeated. The ceiling is set by what Ollama actually serves, not by
+# the model card: nomic-embed-text runs here with n_ctx_slot = 2048, and inputs
+# above that are rejected outright with HTTP 500 ("input is too large to
+# process"). 1800 leaves headroom for the token-count approximation.
+TABLE_MAX_TOKENS = 1800
+EMBED_CONTEXT_LIMIT = 2048
 BATCH_SIZE = 32
 COLLECTION = "giki"
 
@@ -177,11 +180,12 @@ def pack_pieces(pieces: list[str]) -> list[str]:
 def split_table_rows(block: str) -> list[str]:
     """Split an oversized Markdown table on row boundaries, repeating the header.
 
-    Keeping a table whole beats splitting it -- but only while it still fits the
-    embedding model. nomic-embed-text truncates at 8192 tokens, so a 142k-token
-    course catalogue would have ~94% of its rows silently dropped and
-    unsearchable. Splitting between rows and repeating the header keeps every
-    row's column meaning intact, which is the property that actually matters.
+    Keeping a table whole beats splitting it -- but only while it still fits
+    what the embedder accepts. The course catalogue arrived as one 142k-token
+    table; Ollama rejects anything over its 2048-token slot outright, so that
+    table would simply never be indexed. Splitting between rows and repeating
+    the header keeps every row's column meaning intact, which is the property
+    that actually matters.
     """
     # A run of tables with no blank line between them arrives as one block --
     # the course catalogue is dozens of per-course CLO grids concatenated. Split
@@ -240,6 +244,9 @@ def enforce_cap(chunks: list[str]) -> list[str]:
     """
     final: list[str] = []
     for chunk in chunks:
+        if count_tokens(chunk) > EMBED_CONTEXT_LIMIT and not is_table(chunk):
+            final.extend(hard_split(chunk))
+            continue
         if is_table(chunk):
             # Whole if it fits the embedder; otherwise split between rows,
             # never mid-row, with the header carried into each part.
@@ -251,7 +258,16 @@ def enforce_cap(chunks: list[str]) -> list[str]:
             final.append(chunk)
         else:
             final.extend(hard_split(chunk))
-    return final
+
+    # Nothing may exceed what the server accepts -- a rejected chunk is a chunk
+    # that simply is not in the index, which is worse than an imperfect split.
+    guarded: list[str] = []
+    for chunk in final:
+        if count_tokens(chunk) > EMBED_CONTEXT_LIMIT:
+            guarded.extend(hard_split(chunk))
+        else:
+            guarded.append(chunk)
+    return guarded
 
 
 def chunk_text(text: str) -> list[str]:
@@ -411,6 +427,15 @@ def embed_batch(texts: list[str], state: EmbedState) -> list[list[float] | None]
                 vector = embed_one(text)
                 state.consecutive_unreachable = 0
                 break
+            except urllib.error.HTTPError as exc:
+                # The server responded, so it is up. Treat this as a per-chunk
+                # content failure (usually input too large), never as an outage
+                # -- misreading it as one triggered a needless restart and a
+                # spurious STOP mid-run.
+                if attempt < EMBED_RETRIES:
+                    time.sleep(1)
+                else:
+                    record_near_stop(f"embed rejected (HTTP {exc.code}): {text[:60]!r}")
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 state.consecutive_unreachable += 1
                 if state.consecutive_unreachable >= UNREACHABLE_LIMIT:
