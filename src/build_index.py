@@ -485,6 +485,19 @@ def main() -> int:
         record_near_stop(f"STOPPED: {exc}")
         return 1
 
+    # Drop chunks that no longer exist. Re-extraction changes how a page splits,
+    # so a page that used to make 6 chunks and now makes 4 would leave #4 and #5
+    # behind -- stale text, still retrievable, still citing a real URL. Upsert
+    # alone cannot remove them.
+    valid = {r["id"] for r in records}
+    existing = set(collection.get(include=[])["ids"])
+    stale = existing - valid
+    if stale:
+        stale_list = sorted(stale)
+        for i in range(0, len(stale_list), 500):
+            collection.delete(ids=stale_list[i : i + 500])
+        log(f"  removed {len(stale)} stale chunks left by re-extraction")
+
     elapsed = time.monotonic() - started
     log(f"\nStage B done: {done} chunks processed, {state.failures} embed failures")
     log(f"  collection now holds {collection.count()} chunks")
