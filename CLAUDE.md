@@ -86,8 +86,19 @@ editor + autocomplete only. Don't run both agents against the same repo.
   harassment policies. Query with `src/retrieve.py "..."`.
   See `data/logs/phase2_run_summary.txt`.
 
+- **Phase 3 complete** (2026-07-29) — `src/answer.py`: question in → answer out,
+  three modes (GROUNDED / GENERAL-flagged / REFUSE), citations built from chunk
+  metadata so a fabricated URL is structurally impossible. Model: **qwen2.5:7b**
+  (text-only; the VL model stays for later image work). Validation 44/50 modes,
+  0 contract failures — 4 of the 6 "misses" are the corpus rightly beating
+  generic knowledge. See `data/logs/phase3_run_summary.txt`.
+- **Retrieval is now hybrid**: dense + BM25 fused by reciprocal rank, query-intent
+  routing for person questions, ≤3 chunks per source, then LLM reranking.
+  Dean's page went from >40th to 1st; EE-teachers 11th to 1st.
+
 **Next**
-- [ ] Qwen wired to retrieval
+- [ ] Decide how to handle stale sources (see gotchas) — highest-value open issue
+- [ ] Chat UI over `answer.answer()`
 - [ ] Chat UI
 - [ ] Voice
 

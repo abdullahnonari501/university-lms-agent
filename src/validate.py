@@ -84,6 +84,11 @@ QUESTIONS: list[tuple[str, str]] = [
     ("REFUSE", "Who won the GIKI cricket tournament last year?"),
 ]
 
+# Abbreviations must not end a sentence: splitting naively put "Rs." at a
+# boundary, so "The semester fee is Rs. 470,000" became a fragment with the
+# figure separated from the word that gives it meaning.
+SENTENCE_SPLIT_RE = re.compile(r"(?<!\bRs)(?<!\bNo)(?<!\bDr)(?<!\bMr)(?<!\bMs)(?<=[.!?])\s+(?=[A-Z])")
+
 CONTACT_MARKERS = ("admissions@giki.edu.pk", "contact-us", "advisor", "office")
 PERIOD_MARKERS = ("per semester", "semester fee", "annual", "per year", "each semester")
 
@@ -107,10 +112,51 @@ def probe() -> int:
     return 0
 
 
-def check(expected: str, result: ans.Answer, question: str, hits: list[dict]) -> list[str]:
-    """Automatic contract checks. Returns a list of failures."""
+def is_periodic_figure(figure: str, evidence: list[dict]) -> bool:
+    """True when the figure sits under a per-period column in a source table.
+
+    A number inside a Markdown row inherits its meaning from that table's
+    header, so look there rather than at nearby characters. Prose figures (the
+    one-time admission fee) are periodic only if their own sentence says so.
+    """
+    # Boundary-matched: plain containment finds "75,000" inside "175,000" and
+    # attributes the wrong row's meaning to it.
+    pattern = re.compile(rf"(?<![\d,]){re.escape(figure)}(?![\d,])")
+    for hit in evidence:
+        lines = hit["text"].splitlines()
+        for i, line in enumerate(lines):
+            if not pattern.search(line):
+                continue
+            if not line.lstrip().startswith("|"):
+                # Prose: judge the sentence the figure is in. PDF extraction
+                # puts many sentences on one line, so a line-wide test let
+                # "Semester fee cannot be paid in installments" mark the
+                # one-time admission fee in the next sentence as periodic.
+                for sentence in re.split(SENTENCE_SPLIT_RE, line):
+                    if pattern.search(sentence):
+                        low = sentence.lower()
+                        if any(m in low for m in ("semester", "annual", "per year")):
+                            return True
+                continue
+            if line.lstrip().startswith("|"):
+                for header in reversed(lines[max(0, i - 6): i]):
+                    if header.lstrip().startswith("|") and any(
+                        m in header.lower() for m in ("semester", "annual", "per year")
+                    ):
+                        return True
+    return False
+
+
+def check(expected: str, result: ans.Answer, question: str) -> list[str]:
+    """Automatic contract checks. Returns a list of failures.
+
+    Citations are audited against result.evidence -- the chunks the answer was
+    actually built from. Comparing against a fresh search() was wrong: answer()
+    retrieves a wider pool and reranks it, so a second search returns a
+    different set and every legitimate citation looked like a violation.
+    """
     fails = []
-    retrieved = {h["source_url"] for h in hits}
+    retrieved = {h["source_url"] for h in result.evidence}
 
     if result.mode == "GROUNDED":
         if not result.citations:
@@ -131,13 +177,17 @@ def check(expected: str, result: ans.Answer, question: str, hits: list[dict]) ->
         if result.citations:
             fails.append("REFUSE carrying citations")
 
-    # Fee answers must carry the period qualifier -- a bare number invites a
-    # student to budget for the wrong amount.
-    if "fee" in question.lower() and result.mode == "GROUNDED":
-        if re.search(r"\d{2,3},\d{3}", result.text) and not any(
-            m in result.text.lower() for m in PERIOD_MARKERS
-        ):
-            fails.append("fee figure quoted without a period qualifier")
+    # A figure drawn from a per-period column must carry its period. Decided
+    # structurally, not by proximity: the admission fee is one-time prose that
+    # happens to sit next to the semester table, so a character window around
+    # the number called it periodic and failed a correct answer.
+    if result.mode == "GROUNDED":
+        for figure in re.findall(r"\d{2,3},\d{3}", result.text):
+            if is_periodic_figure(figure, result.evidence) and not any(
+                m in result.text.lower() for m in PERIOD_MARKERS
+            ):
+                fails.append(f"periodic figure {figure} quoted without its period")
+                break
 
     if result.mode != expected:
         fails.append(f"mode {result.mode}, expected {expected}")
@@ -163,9 +213,8 @@ def main() -> int:
 
     rows, wrong_mode, contract_fails = [], [], []
     for n, (expected, q) in enumerate(QUESTIONS, 1):
-        hits = search(q, k=ans.TOP_K)
         result = ans.answer(q, model=args.model, threshold=args.threshold)
-        fails = check(expected, result, q, hits)
+        fails = check(expected, result, q)
         rows.append((expected, result, q, fails))
         if any(f.startswith("mode ") for f in fails):
             wrong_mode.append((q, expected, result.mode))

@@ -42,9 +42,18 @@ RESPONSE_RESERVE = 800
 CHUNK_BUDGET = 6000
 
 TOP_K = 5
-# Tuned empirically in Stage 3; see phase3_run_summary.txt. Strong topical hits
-# in this corpus score ~0.70-0.79, clear misses ~0.60-0.66.
-RELEVANCE_THRESHOLD = 0.68
+# A similarity floor, not a decision rule. Measured over the 50-question
+# battery, the three modes' score distributions overlap almost entirely:
+#   GROUNDED  min 0.666  median 0.786  max 0.850
+#   GENERAL   min 0.634  median 0.699  max 0.846
+#   REFUSE    min 0.582  median 0.690  max 0.774
+# The lowest GROUNDED question scores below the highest REFUSE one, so no cutoff
+# can separate them and tuning the number is wasted effort. Whether the evidence
+# answers the question is decided by reading the evidence -- the model's
+# ANSWERED signal plus unsupported_claims() -- not by a proxy score. This floor
+# only skips a grounded attempt when retrieval returned nothing resembling the
+# question at all.
+RELEVANCE_THRESHOLD = 0.50
 
 GENERAL_FLAG = "⚠ Not from GIKI's website — general knowledge:"
 
@@ -98,6 +107,10 @@ class Answer:
     latency_s: float = 0.0
     chunks_used: int = 0
     model: str = DEFAULT_MODEL
+    # The chunks actually placed in context. Callers auditing citations must
+    # check against these, not against a fresh search() -- reranking means a
+    # second search returns a different set.
+    evidence: list[dict] = field(default_factory=list)
 
     def render(self) -> str:
         out = [f"[{self.mode}]  (top score {self.top_score:.4f}, "
@@ -299,20 +312,27 @@ the ones that genuinely help; omit the rest. Example: 3, 1, 7
 Answer:"""
 
 
-def dedupe_by_source(hits: list[dict]) -> list[dict]:
-    """Keep the best chunk per source page.
+MAX_PER_SOURCE = 3
 
-    Several chunks from one long page otherwise occupy most of the top-k --
-    on "Who is the Dean", one person's profile held ranks 2, 5 and 7, pushing
-    the page that actually names the Dean out of contention.
+
+def dedupe_by_source(hits: list[dict], max_per_source: int = MAX_PER_SOURCE) -> list[dict]:
+    """Cap how many chunks one source page may contribute.
+
+    One chunk per page was too strict: the Student Handbook is a 103 KB document
+    of ~100 chunks, so keeping only its best-scoring chunk usually dropped the
+    section that actually answered the question -- discipline and transport both
+    came back as "the sources do not contain this" while the handbook and the
+    transport policy sat in the corpus. Capping instead of deduping keeps a long
+    document from monopolising the top-k (one profile held ranks 2, 5 and 7 on
+    the Dean query) while still letting it contribute several sections.
     """
-    seen: set[str] = set()
+    counts: dict[str, int] = {}
     out = []
     for hit in hits:
         key = hit.get("source_url", "")
-        if key in seen:
+        if counts.get(key, 0) >= max_per_source:
             continue
-        seen.add(key)
+        counts[key] = counts.get(key, 0) + 1
         out.append(hit)
     return out
 
@@ -405,7 +425,7 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
                       file=sys.stderr, flush=True)
             else:
                 return Answer("GROUNDED", body, citations, top,
-                              time.monotonic() - started, len(kept), model)
+                              time.monotonic() - started, len(kept), model, kept)
         # Retrieval was topically close but held no answer. Treat that exactly
         # like a below-threshold miss and let the classifier decide, so
         # "how do I improve my CGPA" can still fall to GENERAL rather than
