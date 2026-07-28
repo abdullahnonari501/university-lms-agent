@@ -72,7 +72,10 @@ DOCUMENTS = [
     ("student-handbook-2023-24", "https://giki.edu.pk/wp-content/uploads/2023/10/GIK-Institute-Student-Handbook-2023-24-General-Rules-Policies-and-Disicpline.pdf"),
     ("academic-calendar-2025-2026", "http://giki.edu.pk/wp-content/uploads/2025/08/Academic-Calendar-2025-2026.pdf"),
     ("transportation-policy", "https://giki.edu.pk/wp-content/uploads/2023/09/Transportation-Policy-for-Ghulam-Ishaq-Khan-Institute-of-Engineering-Sciences-and-Technology-1.pdf"),
-    ("undergraduate-admissions-policy", "http://192.168.100.53/wp-content/uploads/2019/10/Undergraduate-Admissions-Policy.pdf"),
+    # The inventory link for this one points at an internal address that leaked
+    # into the site HTML. The public host serves the identical file, and this is
+    # the URL the bot must cite -- students cannot open 192.168.100.53.
+    ("undergraduate-admissions-policy", "https://giki.edu.pk/wp-content/uploads/2019/10/Undergraduate-Admissions-Policy.pdf"),
     ("prospectus-fcse-2023-breakdown", "https://giki.edu.pk/wp-content/uploads/2024/01/Prospectus-FCSE-2023-v1.6-DS-Semester-wise-Breakdown.pdf"),
     ("graduate-prospectus-2024", "https://giki.edu.pk/wp-content/uploads/2023/11/GraduateProspectus2024.pdf"),
     ("ug-prospectus-2021", "https://giki.edu.pk/wp-content/uploads/2021/10/UG_Prospectus_2021.pdf"),

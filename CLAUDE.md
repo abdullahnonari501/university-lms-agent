@@ -74,8 +74,16 @@ editor + autocomplete only. Don't run both agents against the same repo.
   **No fee schedule exists anywhere on the public site.** Degree requirements
   live in the prospectuses. Don't promise fee answers from public data.
 
+- **Phase 2 retrieval layer complete** (2026-07-28) — **3,682 chunks** in
+  chromadb (`data/chroma`, collection `giki`, cosine), embedded with
+  `nomic-embed-text` (768-dim) via Ollama. 0 embedding failures. Chunks are
+  512-token target / 64 overlap; **tables are atomic** (66 kept whole).
+  All 9 verified PDFs parsed with docling (145k words added) — handbook,
+  academic calendar, both prospectuses, transport + admissions + disabilities +
+  harassment policies. Query with `src/retrieve.py "..."`.
+  See `data/logs/phase2_run_summary.txt`.
+
 **Next**
-- [ ] Embeddings / retrieval layer
 - [ ] Qwen wired to retrieval
 - [ ] Chat UI
 - [ ] Voice
@@ -106,6 +114,14 @@ turn out to be JavaScript-rendered.
   time — a trickling server hung the crawl 15+ min mid-run, twice, with
   `timeout=15` set. `fetch()` in `overnight_scrape.py` streams under a hard
   90s wall-clock cap. Any new fetch code must go through it.
+- **Never return large data through `mp.Queue.put()`.** It blocks past the OS
+  pipe buffer (~64 KB) until the parent drains it — and if the parent is in
+  `proc.join()`, that's a deadlock. Cost 4 debugging passes in Phase 2: every
+  PDF over ~16k words "hung", every small one worked. Hand back a temp-file path.
+- Pin `OMP_NUM_THREADS=1` (+ MKL/OPENBLAS) for docling, and set
+  `HF_HUB_OFFLINE=1` — docling phones HuggingFace even with weights cached.
+- **There is no fee data anywhere on the public site.** Not in HTML, not in any
+  of the 130 PDFs. The bot must refuse fee questions, not improvise.
 
 **Open question:** the GIKI LMS itself is behind a login. The public website is
 scrapeable; the authenticated LMS is not, without institutional permission. Decide
