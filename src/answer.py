@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -49,13 +50,14 @@ GENERAL_FLAG = "⚠ Not from GIKI's website — general knowledge:"
 
 SYSTEM_GROUNDED = """You are a helpful assistant for students of GIK Institute (GIKI), Pakistan.
 
-Answer the question using ONLY the numbered sources below. Rules:
+Answer the question using ONLY the numbered sources provided. Rules:
 - Use only facts present in the sources. Never add facts from your own knowledge.
-- If the sources contain a table, read it carefully: match each number to its
-  column heading and row label before stating it.
-- If the sources do not fully answer the question, say exactly what they do and
-  do not cover.
-- Be concise and direct. No preamble.
+- When you quote any number from a table, state its qualifiers from the row
+  label and column heading: the unit, the period, and the category. Write
+  "Rs. 470,000 per semester for Engineering & Computing", never a bare number.
+- Be complete: if the question asks about charges, dates or requirements in
+  general, give every relevant item the sources list, not just the first one.
+  No preamble and no padding, but do not omit facts the question asked for.
 - Refer to sources inline as [1], [2] where relevant.
 - Never invent a URL."""
 
@@ -147,11 +149,84 @@ def fit_chunks(hits: list[dict]) -> list[dict]:
     return kept
 
 
+def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
+    """Pull the ANSWERED / SOURCES_USED header off the reply.
+
+    A structured field is used rather than string-matching English phrasing,
+    which varies between models and prompt tweaks and would rot silently.
+    Returns (answered, citations, body).
+
+    On an unparseable header we assume answered=True and fall back to citing
+    every retrieved source: that preserves the previous, safe behaviour rather
+    than discarding a real answer.
+    """
+    answered = True
+    named: list[int] = []
+    body = raw
+    header_seen = False
+
+    lines = raw.splitlines()
+    consumed = 0
+    for line in lines[:6]:
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("ANSWERED:"):
+            answered = "NO" not in upper.split(":", 1)[1].strip().upper()[:3]
+            header_seen = True
+            consumed += 1
+        elif upper.startswith("SOURCES_USED:"):
+            named = [int(n) for n in re.findall(r"\d+", stripped.split(":", 1)[1])]
+            header_seen = True
+            consumed += 1
+        elif stripped == "---" and header_seen:
+            consumed += 1
+            break
+        elif not stripped:
+            consumed += 1
+        else:
+            break
+
+    if header_seen:
+        body = "\n".join(lines[consumed:]).strip()
+
+    # Validate: a cited URL must be one we actually retrieved. Anything the
+    # model names outside that set is dropped, so it can never introduce a URL.
+    retrieved = [h["source_url"] for h in hits]
+    citations: list[str] = []
+    for n in named:
+        if 1 <= n <= len(retrieved):
+            url = retrieved[n - 1]
+            if url and url not in citations:
+                citations.append(url)
+
+    if not citations and answered:
+        for url in retrieved:  # safe fallback: disclose everything we searched
+            if url and url not in citations:
+                citations.append(url)
+
+    return answered, citations, body or raw.strip()
+
+
 def build_grounded_prompt(question: str, hits: list[dict]) -> str:
     parts = []
     for i, hit in enumerate(hits, 1):
         parts.append(f"[{i}] {hit['title']}\nURL: {hit['source_url']}\n{hit['text']}")
-    return "SOURCES:\n\n" + "\n\n---\n\n".join(parts) + f"\n\nQUESTION: {question}\n\nANSWER:"
+    # The output-format contract is repeated here, after the sources, because
+    # this 7B model dropped it entirely when it lived only in the system prompt.
+    return (
+        "SOURCES:\n\n"
+        + "\n\n---\n\n".join(parts)
+        + f"\n\nQUESTION: {question}\n\n"
+        "Reply in exactly this format, starting on the first line:\n\n"
+        "ANSWERED: <yes if the sources above contain facts answering the "
+        "question, otherwise no>\n"
+        "SOURCES_USED: <comma-separated numbers of the sources you drew facts "
+        "from, empty if none>\n"
+        "---\n"
+        "<your answer>\n\n"
+        "If ANSWERED is no, say briefly what the sources are missing.\n\n"
+        "ANSWERED:"
+    )
 
 
 def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
@@ -162,15 +237,21 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
 
     if hits and top >= threshold:
         kept = fit_chunks(hits)
-        text = call_qwen(model, SYSTEM_GROUNDED, build_grounded_prompt(question, kept))
-        # Citations are built from chunk metadata, never parsed out of the
-        # model's text -- that makes a fabricated or altered URL impossible.
-        citations: list[str] = []
-        for hit in kept:
-            if hit["source_url"] and hit["source_url"] not in citations:
-                citations.append(hit["source_url"])
-        return Answer("GROUNDED", text, citations, top, time.monotonic() - started,
-                      len(kept), model)
+        raw = call_qwen(model, SYSTEM_GROUNDED, build_grounded_prompt(question, kept))
+        # The prompt ends primed with "ANSWERED:", so the reply continues from
+        # there rather than repeating the label. Put it back before parsing.
+        if not raw.lstrip().upper().startswith("ANSWERED"):
+            raw = f"ANSWERED: {raw.lstrip()}"
+        # Citations resolve through chunk metadata by index, so the model can
+        # only ever narrow the retrieved set -- it cannot introduce a URL.
+        answered, citations, body = parse_structured(raw, kept)
+        if answered:
+            return Answer("GROUNDED", body, citations, top, time.monotonic() - started,
+                          len(kept), model)
+        # Retrieval was topically close but held no answer. Treat that exactly
+        # like a below-threshold miss and let the classifier decide, so
+        # "how do I improve my CGPA" can still fall to GENERAL rather than
+        # dead-ending in a refusal.
 
     if classify_question(model, question) == "GENERIC":
         text = call_qwen(model, SYSTEM_GENERAL, question)
