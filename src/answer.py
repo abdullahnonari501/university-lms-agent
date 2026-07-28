@@ -59,7 +59,9 @@ Answer the question using ONLY the numbered sources provided. Rules:
   general, give every relevant item the sources list, not just the first one.
   No preamble and no padding, but do not omit facts the question asked for.
 - Refer to sources inline as [1], [2] where relevant.
-- Never invent a URL."""
+- Never invent a URL.
+- Never state a person's name unless that exact name appears in the sources. If
+  a source mentions a role but names nobody, say the sources do not name them."""
 
 SYSTEM_GENERAL = """You are a helpful assistant. Answer the question from your own general
 knowledge, concisely and accurately.
@@ -207,6 +209,61 @@ def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
     return answered, citations, body or raw.strip()
 
 
+NAME_PATTERN = re.compile(r"\b(?:Dr|Prof|Professor|Mr|Ms|Mrs|Engr)\.?\s+([A-Z][A-Za-z.\-']+(?:\s+[A-Z][A-Za-z.\-']+){0,3})")
+# Real figures only: thousands-separated (470,000) or 4+ bare digits. Without
+# the group-of-three requirement this matched "1,2,3,4" out of citation markers
+# like "[1], [2], [3] and [4]" and rejected perfectly good answers.
+NUMBER_PATTERN = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d{4,})(?![\w])")
+# Titles and degrees are not part of a name. "PhD" appears somewhere in almost
+# every chunk, so counting it as a name part made any invented name look
+# supported -- which is exactly how "Dr. Wahid Haqim PhD" slipped through.
+NAME_NOISE = {"phd", "prof", "professor", "dr", "mr", "ms", "mrs", "engr",
+              "the", "and", "from", "of", "at", "is"}
+
+
+def unsupported_claims(body: str, hits: list[dict]) -> list[str]:
+    """Names and large figures in the answer that appear in no retrieved chunk.
+
+    Both 7B models invented a Dean's name for a page that reads "MESSAGE FROM
+    THE DEAN" but names nobody -- and returned it as GROUNDED with citations,
+    which is the most dangerous shape a wrong answer can take. Prompting alone
+    did not prevent it, so verify the claim against the evidence directly.
+
+    Deliberately narrow: only titled person-names and 4+ digit numbers, the two
+    things this bot must never invent. Prose is left to the prompt rules.
+    """
+    # Must cover everything the model was shown, not just chunk bodies: the
+    # prompt includes each source's title and URL, so a year or name taken from
+    # a title ("Student Handbook 2023-24") is properly grounded, and checking
+    # text alone rejected correct answers.
+    haystack = " ".join(
+        f"{h.get('title', '')} {h.get('source_url', '')} {h['text']}" for h in hits
+    )
+    normalised = re.sub(r"\s+", " ", haystack).lower()
+    # Separate haystack for figures with separators stripped, so "470,000" in
+    # the answer matches "470,000" or "470000" in the source. Collapsing commas
+    # to spaces instead turned the source into "470 000" and rejected the
+    # correct fee answer.
+    numeric = re.sub(r"[,\s]", "", haystack)
+    bad: list[str] = []
+
+    for name in NAME_PATTERN.findall(body):
+        parts = [p for p in re.split(r"\s+", name)
+                 if len(p) > 2 and p.lower().strip(".") not in NAME_NOISE]
+        if not parts:
+            continue
+        # Require the surname itself to appear. Matching on *any* part is far
+        # too lenient for names built from common given names.
+        if parts[-1].lower().strip(".,") not in normalised:
+            bad.append(name)
+
+    for number in NUMBER_PATTERN.findall(body):
+        if number.replace(",", "") not in numeric:
+            bad.append(number)
+
+    return bad
+
+
 def build_grounded_prompt(question: str, hits: list[dict]) -> str:
     parts = []
     for i, hit in enumerate(hits, 1):
@@ -246,8 +303,16 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
         # only ever narrow the retrieved set -- it cannot introduce a URL.
         answered, citations, body = parse_structured(raw, kept)
         if answered:
-            return Answer("GROUNDED", body, citations, top, time.monotonic() - started,
-                          len(kept), model)
+            # Last line of defence: a name or figure that appears in no chunk is
+            # fabricated, whatever the model claimed. Drop to the classifier
+            # rather than emit an invented fact wearing citations.
+            invented = unsupported_claims(body, kept)
+            if invented:
+                print(f"  [guard] dropped unsupported claim(s): {invented}",
+                      file=sys.stderr, flush=True)
+            else:
+                return Answer("GROUNDED", body, citations, top,
+                              time.monotonic() - started, len(kept), model)
         # Retrieval was topically close but held no answer. Treat that exactly
         # like a below-threshold miss and let the classifier decide, so
         # "how do I improve my CGPA" can still fall to GENERAL rather than
