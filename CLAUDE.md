@@ -99,7 +99,6 @@ editor + autocomplete only. Don't run both agents against the same repo.
 **Next**
 - [ ] Decide how to handle stale sources (see gotchas) — highest-value open issue
 - [ ] Chat UI over `answer.answer()`
-- [ ] Chat UI
 - [ ] Voice
 
 ---
