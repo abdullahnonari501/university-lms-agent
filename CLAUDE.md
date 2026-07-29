@@ -34,9 +34,9 @@ Qwen (via Ollama) answers student questions. Voice added later.
 | | Laptop (Windows) | Pop!_OS box |
 |---|---|---|
 | Role | Thin client. Screen only. | The actual computer |
-| Runs | Cursor | Everything else |
+| Runs | VS Code | Everything else |
 
-- **Connection:** Cursor Remote Tunnel (`pop-os-tunnel`), GitHub auth, via Microsoft relay
+- **Connection:** VS Code Remote Tunnel (tunnel name `popos`), GitHub auth, via Microsoft relay
 - **Why not SSH/Tailscale:** the network runs a Fortinet firewall doing TLS
   inspection on `controlplane.tailscale.com`. Tailscale pins its cert and refuses
   the intercepted connection, hanging forever. Tunnels use the system trust store
@@ -46,7 +46,7 @@ Qwen (via Ollama) answers student questions. Voice added later.
 - **Durability:** GitHub. The Pop!_OS box is not permanently mine — anything not
   pushed does not exist.
 
-**Agent roles:** Claude Code is the driver (multi-file, agentic work). Cursor is
+**Agent roles:** Claude Code is the driver (multi-file, agentic work). VS Code is
 editor + autocomplete only. Don't run both agents against the same repo.
 
 ---
@@ -56,7 +56,7 @@ editor + autocomplete only. Don't run both agents against the same repo.
 **Done**
 - Private repo `abdullahnonari501/university-lms-agent`
 - `.gitignore` (Python + Node; excludes venv, node_modules, .env, model weights)
-- Cursor tunnel connected, running as a persistent service
+- VS Code tunnel `popos` connected, running as a persistent service
 - Ollama + Qwen live on the Pop!_OS box
 - **Phase 1 scrape complete** (2026-07-26) — **1,094 pages** of clean text from
   `giki.edu.pk`: 614 courses, 319 pages, 152 personnel, 9 departments. 6.17 MB.
