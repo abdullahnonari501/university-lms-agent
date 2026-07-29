@@ -14,6 +14,7 @@ follow-ups work -- storing messages alone would not.
 
 import argparse
 import json
+import ssl
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import answer as ans  # noqa: E402
+import voice  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -93,12 +97,24 @@ PAGE = r"""<!doctype html>
   .chips button { font-size:12.5px; color:var(--muted); background:none;
     border:1px solid var(--line); border-radius:999px; padding:5px 11px; cursor:pointer; }
   .err { color:var(--stop); }
+  .icon { width:44px; padding:0; font-weight:600; color:var(--fg); background:var(--card);
+    border:1px solid var(--line); border-radius:12px; cursor:pointer; font-size:17px; }
+  .icon:disabled { opacity:.4; cursor:default; }
+  .icon.rec { color:#fff; background:#b5342f; border-color:#b5342f;
+    animation:pulse 1.1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+  .speak { background:none; border:0; color:var(--muted); cursor:pointer; font-size:14px;
+    padding:0 4px; margin-left:8px; }
+  .speak:hover { color:var(--fg); }
+  .toggle { font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:5px; }
+  .hint { max-width:780px; margin:0 auto 8px; font-size:12px; color:var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <span class="dot"></span><h1>GIKI Assistant</h1>
   <span class="sp"></span>
+  <label class="toggle"><input type="checkbox" id="auto"> Speak replies</label>
   <button id="clear">New chat</button>
 </header>
 
@@ -111,8 +127,10 @@ PAGE = r"""<!doctype html>
 
 <footer>
   <div class="chips" id="chips"></div>
+  <div class="hint" id="hint"></div>
   <div class="composer">
-    <textarea id="q" rows="1" placeholder="Ask a question&hellip;"></textarea>
+    <button class="icon" id="mic" title="Hold to talk, click to start/stop">&#127908;</button>
+    <textarea id="q" rows="1" placeholder="Ask a question, or tap the mic&hellip;"></textarea>
     <button class="send" id="go">Send</button>
   </div>
 </footer>
@@ -203,6 +221,13 @@ async function send() {
          + '</ol></details>';
     }
     pending.querySelector('.bubble').innerHTML = h;
+    if (caps.tts) {
+      const sp = document.createElement('button');
+      sp.className = 'speak'; sp.textContent = '🔊'; sp.title = 'Read aloud';
+      sp.onclick = () => speakText(d.text, sp);
+      pending.querySelector('.meta').after(sp);
+      if (auto.checked) speakText(d.text, sp);
+    }
 
     history.push({role: 'user', content: q});
     history.push({role: 'assistant', content: d.text});
@@ -212,6 +237,104 @@ async function send() {
       `<span class="err">Couldn't answer: ${esc(e.message)}</span>`;
   } finally {
     busy = false; go.disabled = false; box.focus();
+  }
+}
+
+// ---------------------------------------------------------------- voice
+let caps = {stt:false, tts:false};
+let recorder = null, chunks = [], recording = false;
+const mic = document.getElementById('mic');
+const auto = document.getElementById('auto');
+const hint = document.getElementById('hint');
+
+fetch('/capabilities').then(r => r.json()).then(c => {
+  caps = c;
+  if (!caps.tts) auto.parentElement.style.display = 'none';
+  // getUserMedia only exists in a secure context. Say so plainly rather than
+  // letting the mic button fail silently.
+  if (!navigator.mediaDevices || !window.isSecureContext) {
+    mic.disabled = true;
+    hint.textContent = 'Microphone needs HTTPS or localhost — open the https:// address to dictate.';
+  }
+}).catch(() => {});
+
+// Encode Float32 PCM as 16-bit mono WAV. Done here so the server needs no
+// ffmpeg (absent on the box, and sudo is restricted).
+function toWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  let o = 44;
+  for (const s of samples) {
+    const c = Math.max(-1, Math.min(1, s));
+    v.setInt16(o, c < 0 ? c * 0x8000 : c * 0x7fff, true); o += 2;
+  }
+  return new Blob([buf], {type: 'audio/wav'});
+}
+
+async function startRec() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      mic.classList.remove('rec'); mic.disabled = true;
+      hint.textContent = 'Transcribing…';
+      try {
+        const blob = new Blob(chunks, {type: chunks[0]?.type || 'audio/webm'});
+        const ac = new AudioContext();
+        const decoded = await ac.decodeAudioData(await blob.arrayBuffer());
+        const wav = toWav(decoded.getChannelData(0), decoded.sampleRate);
+        await ac.close();
+        const r = await fetch('/transcribe', {
+          method: 'POST', headers: {'Content-Type': 'audio/wav'}, body: wav});
+        const d = await r.json();
+        if (d.error) throw new Error(d.error);
+        if (d.text) { box.value = (box.value ? box.value + ' ' : '') + d.text; box.focus(); }
+        hint.textContent = d.text ? '' : "Didn't catch that — try again.";
+      } catch (e) {
+        hint.textContent = 'Transcription failed: ' + e.message;
+      } finally {
+        mic.disabled = false;
+      }
+    };
+    recorder.start();
+    recording = true;
+    mic.classList.add('rec');
+    hint.textContent = 'Listening… click the mic again to stop.';
+  } catch (e) {
+    hint.textContent = 'Microphone blocked: ' + e.message;
+  }
+}
+
+mic.onclick = () => {
+  if (recording) { recording = false; recorder.stop(); }
+  else startRec();
+};
+
+let audioEl = null;
+async function speakText(text, btn) {
+  if (audioEl) { audioEl.pause(); audioEl = null; }
+  if (btn) btn.textContent = '⏳';
+  try {
+    const r = await fetch('/speak', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})});
+    if (!r.ok) throw new Error('speech unavailable');
+    audioEl = new Audio(URL.createObjectURL(await r.blob()));
+    audioEl.onended = () => { if (btn) btn.textContent = '🔊'; };
+    await audioEl.play();
+  } catch (e) {
+    if (btn) btn.textContent = '🔇';
+  } finally {
+    if (btn && btn.textContent === '⏳') btn.textContent = '🔊';
   }
 }
 
@@ -248,10 +371,48 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        elif self.path == "/capabilities":
+            body = json.dumps({"stt": True, "tts": voice.tts_ready()}).encode()
+            self._send(200, body, "application/json")
         else:
             self._send(404, b"not found", "text/plain")
 
+    def _transcribe(self) -> None:
+        """Browser posts 16 kHz mono WAV; Whisper returns text."""
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 25 * 1024 * 1024:
+            self._send(413, b'{"error":"audio too large"}', "application/json")
+            return
+        try:
+            text = voice.transcribe(self.rfile.read(length))
+            body = json.dumps({"text": text}).encode()
+        except Exception as exc:  # noqa: BLE001
+            body = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode()
+        self._send(200, body, "application/json")
+
+    def _speak(self) -> None:
+        """Text in, WAV out. Empty body means TTS is unavailable, which the UI
+        treats as 'hide the speaker button' rather than an error."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            text = str(json.loads(self.rfile.read(length)).get("text", ""))
+            audio = voice.speak(text)
+        except Exception:  # noqa: BLE001
+            audio = b""
+        if not audio:
+            self._send(503, b"", "audio/wav")
+            return
+        self._send(200, audio, "audio/wav")
+
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/transcribe":
+            with self.lock:
+                self._transcribe()
+            return
+        if self.path == "/speak":
+            with self.lock:
+                self._speak()
+            return
         if self.path != "/ask":
             self._send(404, b"not found", "text/plain")
             return
@@ -293,10 +454,29 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--cert", default=str(REPO_ROOT / "certs" / "server.crt"))
+    ap.add_argument("--key", default=str(REPO_ROOT / "certs" / "server.key"))
+    ap.add_argument("--http", action="store_true",
+                    help="serve plain HTTP (microphone will be blocked off localhost)")
     args = ap.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"GIKI Assistant on http://{args.host}:{args.port}  (Ctrl-C to stop)", flush=True)
+
+    # Browsers refuse getUserMedia outside a secure context, so HTTPS is not
+    # optional if the page is to be opened anywhere but localhost. A self-signed
+    # cert triggers a one-time browser warning; nothing here needs a real CA.
+    scheme = "http"
+    if not args.http and Path(args.cert).exists() and Path(args.key).exists():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.cert, args.key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+    elif not args.http:
+        print("  no cert found -- falling back to HTTP; microphone will only "
+              "work via localhost", flush=True)
+
+    print(f"GIKI Assistant on {scheme}://{args.host}:{args.port}  (Ctrl-C to stop)",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

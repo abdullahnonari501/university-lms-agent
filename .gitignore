@@ -51,6 +51,13 @@ models/
 checkpoints/
 weights/
 
+# --- Local TLS (self-signed, per-machine; never commit a private key) ---
+certs/server.key
+certs/server.crt
+
+# --- Downloaded speech models (large, re-downloadable) ---
+models/
+
 # --- Scraped data / logs ---
 data/
 

@@ -102,11 +102,21 @@ editor + autocomplete only. Don't run both agents against the same repo.
   `condense_question()` rewrites follow-ups into standalone queries *before*
   retrieval — retrieval has no memory, so storing messages alone would not work.
   Shows mode badge, collapsible sources, and renders Markdown tables as tables.
+- **Voice works, fully local** (`src/voice.py`) — Whisper small on GPU for
+  dictation (~0.8s), Piper for replies. Nothing leaves the box.
+  **Served over HTTPS** (`certs/server.*`, self-signed, gitignored): browsers
+  block the microphone outside a secure context, so plain HTTP only works on
+  localhost. Run `--host 0.0.0.0 --port 8443`.
+  Audio is encoded to WAV *in the browser* — ffmpeg is absent and sudo is
+  restricted, so stdlib `wave` reads it server-side.
+  `STT_VOCAB` biases Whisper toward GIKI/FCSE/CGPA; keep collision-prone
+  acronyms out of it (FES made Whisper hear "fees" as "FES").
 
 **Next**
 - [ ] Fee-page scoping bug: UG and graduate fee pages can land in one answer
 - [ ] Streaming responses (answers take 5–16s; the page just spins)
-- [ ] Voice
+- [ ] Streaming replies (5–18s with only a typing dot)
+- [ ] Persist/restore `data/` — corpus + index exist only on this box
 
 ---
 
