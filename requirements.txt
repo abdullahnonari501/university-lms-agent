@@ -1,2 +1,20 @@
+# Phase 1 - scraping (src/scraper.py, src/overnight_scrape.py)
+# Runs in .lms-venv; deliberately minimal so the crawler has few moving parts.
 requests
 beautifulsoup4
+certifi
+
+# Phase 2 - documents and retrieval (src/ingest_docs.py, src/build_index.py,
+# src/retrieve.py). Runs in .venv.
+docling            # PDF -> Markdown, preserving tables
+chromadb           # vector store; data/chroma
+
+# Phase 3/4 - answering and voice (src/answer.py, src/serve.py, src/voice.py)
+transformers       # Whisper for speech-to-text
+torch              # Whisper backend; CUDA build if a GPU is present
+
+# Not pip-installable, required at runtime:
+#   ollama          - serves qwen2.5:7b and nomic-embed-text  (https://ollama.com)
+#   piper + a voice - text-to-speech, unpacked into models/
+#                     https://github.com/rhasspy/piper/releases
+# The web UI itself uses only the standard library.

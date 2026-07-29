@@ -58,11 +58,13 @@ editor + autocomplete only. Don't run both agents against the same repo.
 - `.gitignore` (Python + Node; excludes venv, node_modules, .env, model weights)
 - VS Code tunnel `popos` connected, running as a persistent service
 - Ollama + Qwen live on the Pop!_OS box
-- **Phase 1 scrape complete** (2026-07-26) — **1,094 pages** of clean text from
-  `giki.edu.pk`: 614 courses, 319 pages, 152 personnel, 9 departments. 6.17 MB.
-  Sitemap-seeded (1,414 target URLs), 319 thin pages (<100 words) skipped,
-  only 4 failures, no STOP condition. Run via `src/overnight_scrape.py`;
-  see `data/logs/run_summary.txt`.
+- **Phase 1 scrape complete**, re-run twice since (2026-07-29 current) —
+  **1,297 pages + 9 PDFs = 1,306 files** from `giki.edu.pk`:
+  707 courses, 397 pages, 184 personnel, 9 departments, 9 documents.
+  Sitemap-seeded (1,414 target URLs). Run via `src/overnight_scrape.py`;
+  see `data/logs/run_summary.txt` and `data/logs/coverage_report.txt`.
+  The first run saved only 1,094 — a 100-word floor was deleting real content.
+  Filtering is now identity-based, not length-based (see gotchas).
 - **130 unique PDF/DOC files inventoried** in `data/logs/found_documents.txt`
   (URLs only — nothing downloaded or parsed). The file has 12,208 *lines*, but
   that's link occurrences: two footer PDFs account for 11,957 of them. Always
@@ -76,7 +78,7 @@ editor + autocomplete only. Don't run both agents against the same repo.
   existed anywhere; that was inferred from the empty `/fee/*` pages plus no fee
   PDF, and it was simply wrong. Check every path before declaring data absent.
 
-- **Phase 2 retrieval layer complete** (2026-07-28) — **4,210 chunks** in
+- **Phase 2 retrieval layer complete** (2026-07-28) — **4,363 chunks** in
   chromadb (`data/chroma`, collection `giki`, cosine), embedded with
   `nomic-embed-text` (768-dim) via Ollama. 0 embedding failures. Chunks are
   512-token target / 64 overlap; **tables preserved** (756 pages, 9,638 rows) —
@@ -96,8 +98,10 @@ editor + autocomplete only. Don't run both agents against the same repo.
   routing for person questions, ≤3 chunks per source, then LLM reranking.
   Dean's page went from >40th to 1st; EE-teachers 11th to 1st.
 
-- **Phase 4 (chat UI)** — `src/serve.py`, stdlib only (no Flask/FastAPI, nothing
-  to install, no root). `python3 src/serve.py --host 0.0.0.0` → port 8000.
+- **Phase 4 (chat UI + voice) complete** (2026-07-30) — `src/serve.py`, stdlib
+  only (no Flask/FastAPI, nothing to install, no root).
+  `python3 src/serve.py --host 0.0.0.0 --port 8443` (HTTPS) or
+  `--port 8137 --http` (plain, for tunnel forwarding).
   **Multi-turn**: the browser holds the transcript, the server is stateless, and
   `condense_question()` rewrites follow-ups into standalone queries *before*
   retrieval — retrieval has no memory, so storing messages alone would not work.
@@ -111,6 +115,10 @@ editor + autocomplete only. Don't run both agents against the same repo.
   restricted, so stdlib `wave` reads it server-side.
   `STT_VOCAB` biases Whisper toward GIKI/FCSE/CGPA; keep collision-prone
   acronyms out of it (FES made Whisper hear "fees" as "FES").
+- **Data is backed up off-box** — GitHub Release `data-backup-20260730`,
+  224 MB tar of `data/`. `data/` stays gitignored; restore with
+  `tar xzf giki-data-*.tar.gz -C .` after cloning. Re-take this after any
+  re-scrape; it is the only thing not reproducible from git.
 
 **Next**
 - [ ] Fee-page scoping bug: UG and graduate fee pages can land in one answer
