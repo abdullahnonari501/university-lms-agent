@@ -461,36 +461,55 @@ def main() -> int:
                     help="serve plain HTTP (microphone will be blocked off localhost)")
     args = ap.parse_args()
 
-    # Dual-stack. /etc/hosts resolves "localhost" to ::1 before 127.0.0.1 here,
-    # so an IPv4-only socket is invisible to anything that connects by name --
-    # which is how VS Code's port forwarding reaches a service.
-    class DualStackServer(ThreadingHTTPServer):
-        address_family = socket.AF_INET6
+    # Two listeners on the same port, one per address family. Both are needed:
+    #
+    #   IPv4 (0.0.0.0) -- VS Code's port scanner reads /proc/net/tcp, the IPv4
+    #     table. A dual-stack IPv6 socket appears only in /proc/net/tcp6, so it
+    #     is invisible to auto-forwarding. Every port VS Code did forward here
+    #     (ollama, the extension host) is listed in the IPv4 table.
+    #   IPv6 ([::], V6ONLY) -- this box's /etc/hosts resolves "localhost" to ::1
+    #     before 127.0.0.1, so anything connecting by name lands on IPv6.
+    #
+    # V6ONLY=1 lets the two coexist rather than fighting over the port.
+    def build(family: int, bind: str):
+        class Server(ThreadingHTTPServer):
+            address_family = family
 
-        def server_bind(self):
-            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            super().server_bind()
+            def server_bind(self):
+                if family == socket.AF_INET6:
+                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                super().server_bind()
 
-    host = args.host
-    try:
-        bind_host = "::" if host in ("0.0.0.0", "::", "") else host
-        server = DualStackServer((bind_host, args.port), Handler)
-    except OSError:
-        # No IPv6 on this kernel/interface -- fall back rather than refuse to run.
-        server = ThreadingHTTPServer((host, args.port), Handler)
+        return Server((bind, args.port), Handler)
 
-    # Browsers refuse getUserMedia outside a secure context, so HTTPS is not
-    # optional if the page is to be opened anywhere but localhost. A self-signed
-    # cert triggers a one-time browser warning; nothing here needs a real CA.
+    wildcard = args.host in ("0.0.0.0", "::", "")
+    plan = ([(socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")] if wildcard
+            else [(socket.AF_INET, args.host)])
+
+    servers = []
+    for family, bind in plan:
+        try:
+            servers.append(build(family, bind))
+        except OSError as exc:
+            print(f"  note: could not bind {bind}:{args.port} ({exc})", flush=True)
+    if not servers:
+        print(f"error: nothing could bind port {args.port}", flush=True)
+        return 1
+
     scheme = "http"
     if not args.http and Path(args.cert).exists() and Path(args.key).exists():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(args.cert, args.key)
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        for srv in servers:
+            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
         scheme = "https"
     elif not args.http:
-        print("  no cert found -- falling back to HTTP; microphone will only "
-              "work via localhost", flush=True)
+        print("  no cert found -- serving HTTP; the microphone will only work "
+              "via localhost or a forwarded port", flush=True)
+
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    server = servers[0]
 
     print(f"GIKI Assistant on {scheme}://{args.host}:{args.port}  (Ctrl-C to stop)",
           flush=True)
