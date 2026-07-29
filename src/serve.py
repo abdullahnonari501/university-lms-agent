@@ -1,14 +1,15 @@
-"""Phase 4: a chat UI over answer.answer().
+"""Phase 4: chat UI over answer.answer().
 
 Standard library only -- no Flask, no FastAPI, nothing to pip install. The box
 runs a restricted sudo and is not permanently ours, so a server that needs no
 installation and no root is worth more than a nicer framework.
 
-Single-turn by design: Phase 3 fixed answering at one question at a time, and
-conversation memory is a separate piece of work.
+Multi-turn. The server stays stateless: the browser holds the transcript and
+sends it with each turn, and answer() folds it into a standalone search query
+before retrieval. Retrieval itself has no memory, so the rewrite is what makes
+follow-ups work -- storing messages alone would not.
 
-    python3 src/serve.py            # http://127.0.0.1:8000
-    python3 src/serve.py --port 8100 --host 0.0.0.0
+    python3 src/serve.py --host 0.0.0.0        # reachable on the LAN
 """
 
 import argparse
@@ -21,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import answer as ans  # noqa: E402
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -29,132 +30,205 @@ PAGE = """<!doctype html>
 <title>GIKI Assistant</title>
 <style>
   :root {
-    --bg:#faf9f7; --fg:#1c1b19; --muted:#6b6862; --line:#e3e0da;
-    --card:#fff; --accent:#1c5d3a; --warn:#8a5a00; --stop:#6b2d2d;
+    --bg:#faf9f7; --fg:#1c1b19; --muted:#6f6b64; --line:#e4e1db;
+    --card:#fff; --mine:#1c1b19; --mineFg:#faf9f7;
+    --ok:#1c5d3a; --warn:#8a5a00; --stop:#8c3a3a; --accent:#1c5d3a;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#16151a; --fg:#eceae6; --muted:#9b968e; --line:#2e2c33;
-            --card:#1e1d23; --accent:#7bc49a; --warn:#e0b45f; --stop:#e08c8c; }
+    :root { --bg:#131217; --fg:#ecebe7; --muted:#9c978f; --line:#2b2932;
+            --card:#1c1b22; --mine:#ecebe7; --mineFg:#131217;
+            --ok:#7cc79c; --warn:#e2b662; --stop:#e89393; --accent:#7cc79c; }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:16px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  .wrap { max-width:760px; margin:0 auto; padding:32px 20px 80px; }
-  h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.01em; }
-  .sub { color:var(--muted); font-size:14px; margin:0 0 28px; }
-  form { display:flex; gap:8px; margin-bottom:8px; }
-  input[type=text] { flex:1; padding:12px 14px; font-size:16px; color:var(--fg);
-    background:var(--card); border:1px solid var(--line); border-radius:10px; }
-  input[type=text]:focus { outline:2px solid var(--accent); outline-offset:-1px; }
-  button { padding:12px 18px; font-size:15px; font-weight:600; cursor:pointer;
-    color:var(--bg); background:var(--fg); border:0; border-radius:10px; }
-  button:disabled { opacity:.5; cursor:default; }
-  .examples { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:26px; }
-  .examples button { background:transparent; color:var(--muted); font-weight:400;
-    font-size:13px; padding:5px 10px; border:1px solid var(--line); }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
-    padding:18px 20px; margin-bottom:16px; }
-  .badge { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.08em;
-    padding:3px 9px; border-radius:999px; border:1px solid currentColor; }
-  .GROUNDED { color:var(--accent); } .GENERAL { color:var(--warn); } .REFUSE { color:var(--stop); }
-  .meta { color:var(--muted); font-size:12px; margin-left:10px; }
-  .answer { white-space:pre-wrap; margin:14px 0 0; }
-  .answer table { border-collapse:collapse; margin:10px 0; font-size:14px; }
-  .answer td, .answer th { border:1px solid var(--line); padding:5px 9px; }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.07em;
-       color:var(--muted); margin:20px 0 8px; font-weight:600; }
-  ol { margin:0; padding-left:20px; }
-  li { margin-bottom:5px; font-size:14px; word-break:break-all; }
-  a { color:inherit; }
-  .spin { color:var(--muted); font-size:14px; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); display:flex; flex-direction:column;
+    font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { border-bottom:1px solid var(--line); padding:14px 20px; display:flex;
+    align-items:center; gap:12px; background:var(--bg); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; font-weight:650; letter-spacing:-.01em; }
+  header .dot { width:7px; height:7px; border-radius:50%; background:var(--ok); }
+  header .sp { flex:1; }
+  header button { font-size:13px; color:var(--muted); background:none;
+    border:1px solid var(--line); border-radius:8px; padding:5px 11px; cursor:pointer; }
+  main { flex:1; overflow-y:auto; }
+  .thread { max-width:780px; margin:0 auto; padding:24px 20px 8px; }
+  .intro { color:var(--muted); font-size:14px; margin-bottom:22px; }
+  .intro b { color:var(--fg); font-weight:600; }
+  .row { display:flex; margin-bottom:18px; }
+  .row.me { justify-content:flex-end; }
+  .bubble { max-width:88%; padding:12px 15px; border-radius:14px; }
+  .me .bubble { background:var(--mine); color:var(--mineFg); border-bottom-right-radius:4px; }
+  .bot .bubble { background:var(--card); border:1px solid var(--line);
+    border-bottom-left-radius:4px; width:100%; }
+  .badge { display:inline-block; font-size:10px; font-weight:700; letter-spacing:.09em;
+    padding:2px 8px; border-radius:999px; border:1px solid currentColor; vertical-align:2px; }
+  .GROUNDED{color:var(--ok)} .GENERAL{color:var(--warn)} .REFUSE{color:var(--stop)}
+  .meta { color:var(--muted); font-size:11.5px; margin-left:9px; }
+  .body { white-space:pre-wrap; margin-top:11px; }
+  .body table { border-collapse:collapse; margin:10px 0; font-size:13.5px; display:block;
+    overflow-x:auto; max-width:100%; }
+  .body td,.body th { border:1px solid var(--line); padding:5px 9px; text-align:left;
+    white-space:nowrap; }
+  .body th { font-weight:600; }
+  details { margin-top:12px; }
+  summary { color:var(--muted); font-size:12.5px; cursor:pointer; }
+  details ol { margin:8px 0 0; padding-left:20px; }
+  details li { font-size:13px; margin-bottom:4px; word-break:break-all; }
+  a { color:var(--accent); }
+  .rewrite { color:var(--muted); font-size:12.5px; margin-top:9px; font-style:italic; }
+  .typing span { display:inline-block; width:6px; height:6px; margin-right:3px; border-radius:50%;
+    background:var(--muted); animation:b 1.2s infinite; }
+  .typing span:nth-child(2){animation-delay:.2s} .typing span:nth-child(3){animation-delay:.4s}
+  @keyframes b { 0%,60%,100%{opacity:.25} 30%{opacity:1} }
+  footer { border-top:1px solid var(--line); background:var(--bg);
+    position:sticky; bottom:0; padding:12px 20px 16px; }
+  .composer { max-width:780px; margin:0 auto; display:flex; gap:9px; }
+  textarea { flex:1; resize:none; font:inherit; color:var(--fg); background:var(--card);
+    border:1px solid var(--line); border-radius:12px; padding:11px 14px; max-height:140px; }
+  textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .send { padding:0 18px; font-weight:600; color:var(--mineFg); background:var(--mine);
+    border:0; border-radius:12px; cursor:pointer; }
+  .send:disabled { opacity:.45; cursor:default; }
+  .chips { max-width:780px; margin:0 auto 10px; display:flex; flex-wrap:wrap; gap:6px; }
+  .chips button { font-size:12.5px; color:var(--muted); background:none;
+    border:1px solid var(--line); border-radius:999px; padding:5px 11px; cursor:pointer; }
   .err { color:var(--stop); }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>GIKI Assistant</h1>
-  <p class="sub">Answers from GIK Institute's public website. Every answer says
-     where it came from &mdash; or admits it doesn't know.</p>
+<header>
+  <span class="dot"></span><h1>GIKI Assistant</h1>
+  <span class="sp"></span>
+  <button id="clear">New chat</button>
+</header>
 
-  <form id="f">
-    <input type="text" id="q" placeholder="Ask about fees, courses, policies&hellip;"
-           autocomplete="off" autofocus>
-    <button id="go">Ask</button>
-  </form>
-  <div class="examples" id="ex"></div>
+<main><div class="thread" id="thread">
+  <p class="intro">Ask about GIK Institute &mdash; fees, courses, policies, people.
+    Every reply is labelled <b>GROUNDED</b> (from the website, with sources),
+    <b>GENERAL</b> (my own knowledge, flagged) or <b>REFUSE</b> (not published &mdash;
+    it won't guess). Follow-up questions work; it remembers the conversation.</p>
+</div></main>
 
-  <div id="out"></div>
-</div>
+<footer>
+  <div class="chips" id="chips"></div>
+  <div class="composer">
+    <textarea id="q" rows="1" placeholder="Ask a question&hellip;"></textarea>
+    <button class="send" id="go">Send</button>
+  </div>
+</footer>
+
 <script>
-const EXAMPLES = [
-  "What are the undergraduate fee charges?",
-  "What are the rules about student discipline?",
-  "When does the fall semester start?",
-  "What scholarships are available?",
-  "How do I deal with exam stress?"
-];
-const ex = document.getElementById('ex');
-EXAMPLES.forEach(t => {
-  const b = document.createElement('button');
-  b.type = 'button'; b.textContent = t;
-  b.onclick = () => { document.getElementById('q').value = t; ask(); };
-  ex.appendChild(b);
-});
+const CHIPS = ["What are the undergraduate fee charges?",
+               "What are the rules about student discipline?",
+               "What scholarships are available?"];
+let history = [];      // [{role, content}] -- the server is stateless
+let busy = false;
 
-const esc = s => s.replace(/[&<>"']/g, c =>
+const thread = document.getElementById('thread');
+const box = document.getElementById('q');
+const go = document.getElementById('go');
+
+const esc = s => String(s).replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-// Markdown tables survive extraction end-to-end, so render them as tables --
-// a fee table read as plain text is exactly the ambiguity we removed upstream.
+CHIPS.forEach(t => {
+  const b = document.createElement('button');
+  b.textContent = t.length > 42 ? t.slice(0, 40) + '…' : t;
+  b.title = t;
+  b.onclick = () => { box.value = t; send(); };
+  document.getElementById('chips').appendChild(b);
+});
+
+// Markdown tables survive extraction, chunking and retrieval with their columns
+// intact; flattening them back to prose here would undo all of that and make a
+// fee figure ambiguous again.
 function renderBody(text) {
-  const lines = text.split('\\n');
-  let html = '', rows = [];
+  const out = [];
+  let rows = [];
   const flush = () => {
     if (!rows.length) return;
-    const body = rows.filter(r => !/^\\s*\\|[\\s|:-]+\\|\\s*$/.test(r));
-    html += '<table>' + body.map((r, i) => {
-      const cells = r.trim().replace(/^\\||\\|$/g, '').split('|');
+    const body = rows.filter(r => !/^\s*\|[\s|:-]+\|\s*$/.test(r));
+    out.push('<table>' + body.map((r, i) => {
+      const cells = r.trim().replace(/^\||\|$/g, '').split('|');
       const tag = i === 0 ? 'th' : 'td';
       return '<tr>' + cells.map(c => `<${tag}>${esc(c.trim())}</${tag}>`).join('') + '</tr>';
-    }).join('') + '</table>';
+    }).join('') + '</table>');
     rows = [];
   };
-  for (const line of lines) {
+  for (const line of text.split('\n')) {
     if (line.trim().startsWith('|')) rows.push(line);
-    else { flush(); html += esc(line) + '\\n'; }
+    else { flush(); out.push(esc(line)); }
   }
   flush();
-  return html;
+  return out.join('\n');
 }
 
-async function ask() {
-  const q = document.getElementById('q').value.trim();
-  if (!q) return;
-  const out = document.getElementById('out'), go = document.getElementById('go');
-  go.disabled = true;
-  out.innerHTML = '<div class="card spin">Searching the corpus&hellip;</div>';
+function addRow(cls, inner) {
+  const row = document.createElement('div');
+  row.className = 'row ' + cls;
+  row.innerHTML = `<div class="bubble">${inner}</div>`;
+  thread.appendChild(row);
+  row.scrollIntoView({behavior: 'smooth', block: 'end'});
+  return row;
+}
+
+async function send() {
+  const q = box.value.trim();
+  if (!q || busy) return;
+  busy = true; go.disabled = true;
+  box.value = ''; box.style.height = 'auto';
+
+  addRow('me', esc(q));
+  const pending = addRow('bot',
+    '<span class="typing"><span></span><span></span><span></span></span>');
+
   try {
     const r = await fetch('/ask', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: q})
+      body: JSON.stringify({question: q, history})
     });
     const d = await r.json();
     if (d.error) throw new Error(d.error);
-    let h = `<div class="card"><span class="badge ${d.mode}">${d.mode}</span>`;
-    h += `<span class="meta">${d.latency_s.toFixed(1)}s &middot; ${d.chunks_used} sources read &middot; ${esc(d.model)}</span>`;
-    h += `<div class="answer">${renderBody(d.text)}</div>`;
-    if (d.citations.length) {
-      h += '<h2>Sources</h2><ol>' + d.citations.map(c =>
-        `<li><a href="${esc(c)}" target="_blank" rel="noopener">${esc(c)}</a></li>`).join('') + '</ol>';
+
+    let h = `<span class="badge ${d.mode}">${d.mode}</span>`;
+    h += `<span class="meta">${d.latency_s.toFixed(1)}s · ${d.chunks_used} sources read</span>`;
+    h += `<div class="body">${renderBody(d.text)}</div>`;
+    // Show the rewrite only when it changed, so a surprising answer is explicable.
+    if (d.search_query && d.search_query.toLowerCase() !== q.toLowerCase()) {
+      h += `<div class="rewrite">Searched for: “${esc(d.search_query)}”</div>`;
     }
-    out.innerHTML = h + '</div>';
+    if (d.citations.length) {
+      h += `<details><summary>${d.citations.length} source${d.citations.length>1?'s':''}</summary><ol>`
+         + d.citations.map(c => `<li><a href="${esc(c)}" target="_blank" rel="noopener">${esc(c)}</a></li>`).join('')
+         + '</ol></details>';
+    }
+    pending.querySelector('.bubble').innerHTML = h;
+
+    history.push({role: 'user', content: q});
+    history.push({role: 'assistant', content: d.text});
+    if (history.length > 12) history = history.slice(-12);
   } catch (e) {
-    out.innerHTML = `<div class="card err">Something went wrong: ${esc(e.message)}</div>`;
+    pending.querySelector('.bubble').innerHTML =
+      `<span class="err">Couldn't answer: ${esc(e.message)}</span>`;
   } finally {
-    go.disabled = false;
+    busy = false; go.disabled = false; box.focus();
   }
 }
-document.getElementById('f').onsubmit = e => { e.preventDefault(); ask(); };
+
+go.onclick = send;
+box.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+box.addEventListener('input', () => {
+  box.style.height = 'auto';
+  box.style.height = Math.min(box.scrollHeight, 140) + 'px';
+});
+document.getElementById('clear').onclick = () => {
+  history = [];
+  thread.querySelectorAll('.row').forEach(r => r.remove());
+  box.focus();
+};
+box.focus();
 </script>
 </body>
 </html>
@@ -162,8 +236,6 @@ document.getElementById('f').onsubmit = e => { e.preventDefault(); ask(); };
 
 
 class Handler(BaseHTTPRequestHandler):
-    # One question at a time per process would serialise the UI; Ollama itself
-    # queues, so concurrency here only keeps the page responsive.
     lock = threading.Lock()
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
@@ -185,11 +257,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
-            question = json.loads(self.rfile.read(length)).get("question", "").strip()
+            data = json.loads(self.rfile.read(length))
+            question = str(data.get("question", "")).strip()
             if not question:
                 raise ValueError("empty question")
+
+            # Trust nothing from the browser: keep only well-formed turns, and
+            # cap the count so a crafted payload cannot blow the context window.
+            history = [
+                {"role": t.get("role"), "content": str(t.get("content", ""))[:1500]}
+                for t in (data.get("history") or [])
+                if isinstance(t, dict) and t.get("role") in ("user", "assistant")
+            ][-ans.MAX_HISTORY_TURNS * 2:]
+
             with self.lock:
-                result = ans.answer(question)
+                result = ans.answer(question, history=history)
             payload = {
                 "mode": result.mode,
                 "text": result.text,
@@ -197,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                 "latency_s": result.latency_s,
                 "chunks_used": result.chunks_used,
                 "model": result.model,
+                "search_query": result.search_query,
             }
         except Exception as exc:  # noqa: BLE001 - report, never crash the server
             payload = {"error": f"{type(exc).__name__}: {exc}"}

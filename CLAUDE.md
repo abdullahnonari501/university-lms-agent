@@ -96,15 +96,16 @@ editor + autocomplete only. Don't run both agents against the same repo.
   routing for person questions, ≤3 chunks per source, then LLM reranking.
   Dean's page went from >40th to 1st; EE-teachers 11th to 1st.
 
-- **Phase 4 (chat UI) started** — `src/serve.py`, stdlib only (no Flask/FastAPI,
-  nothing to install, no root). `python3 src/serve.py` → http://127.0.0.1:8000.
-  Single-turn; shows the mode badge, sources as links, and renders Markdown
-  tables as real tables so fee figures keep their column meaning.
+- **Phase 4 (chat UI)** — `src/serve.py`, stdlib only (no Flask/FastAPI, nothing
+  to install, no root). `python3 src/serve.py --host 0.0.0.0` → port 8000.
+  **Multi-turn**: the browser holds the transcript, the server is stateless, and
+  `condense_question()` rewrites follow-ups into standalone queries *before*
+  retrieval — retrieval has no memory, so storing messages alone would not work.
+  Shows mode badge, collapsible sources, and renders Markdown tables as tables.
 
 **Next**
 - [ ] Fee-page scoping bug: UG and graduate fee pages can land in one answer
 - [ ] Streaming responses (answers take 5–16s; the page just spins)
-- [ ] Conversation memory (multi-turn)
 - [ ] Voice
 
 ---

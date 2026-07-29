@@ -118,6 +118,9 @@ class Answer:
     # check against these, not against a fresh search() -- reranking means a
     # second search returns a different set.
     evidence: list[dict] = field(default_factory=list)
+    # What retrieval actually searched for. Differs from the user's words on a
+    # follow-up, and showing it is how a user understands a surprising answer.
+    search_query: str = ""
 
     def render(self) -> str:
         out = [f"[{self.mode}]  (top score {self.top_score:.4f}, "
@@ -433,6 +436,78 @@ def source_note(hit: dict) -> str:
     return "; ".join(bits)
 
 
+MAX_HISTORY_TURNS = 6      # keep the last few exchanges; older context rarely helps
+HISTORY_CHAR_CAP = 1200    # and never let it crowd out the retrieved evidence
+
+CONDENSE_PROMPT = """Rewrite the follow-up as a question that can be understood with no
+conversation history, by copying the missing subject in from the conversation.
+
+A follow-up is NOT standalone if it starts with "what about", "and", "how
+about", or contains "it", "that", "them", "those", "there" referring to
+something said earlier. Those must be rewritten.
+
+Examples:
+  Earlier: "What are the undergraduate fee charges?"
+  Follow-up: "what about for MS students?"
+  Standalone question: What are the fee charges for MS students?
+
+  Earlier: "What is the admission fee?"
+  Follow-up: "is it refundable?"
+  Standalone question: Is the admission fee refundable?
+
+  Earlier: "Tell me about FCSE."
+  Follow-up: "who is the dean there?"
+  Standalone question: Who is the dean of FCSE?
+
+  Earlier: "What are the hostel rules?"
+  Follow-up: "What scholarships are available?"
+  Standalone question: What scholarships are available?
+
+Output only the question.
+
+Conversation so far:
+{history}
+
+Follow-up: {question}
+
+Standalone question:"""
+
+
+def format_history(history: list[dict], cap: int = HISTORY_CHAR_CAP) -> str:
+    """Recent turns as plain text, newest kept, oldest dropped under the cap."""
+    lines = []
+    for turn in history[-MAX_HISTORY_TURNS * 2:]:
+        role = "Student" if turn.get("role") == "user" else "Assistant"
+        text = " ".join(str(turn.get("content", "")).split())
+        lines.append(f"{role}: {text[:400]}")
+    out = "\n".join(lines)
+    return out[-cap:] if len(out) > cap else out
+
+
+def condense_question(question: str, history: list[dict], model: str) -> str:
+    """Turn a follow-up into something retrievable on its own.
+
+    Retrieval has no memory: "what about for MS students?" embeds to nothing
+    useful and BM25 finds only the stopwords. The conversation has to be folded
+    into the query *before* search, not after -- this is the piece that makes
+    multi-turn work at all, rather than just displaying old messages.
+    """
+    if not history:
+        return question
+    try:
+        rewritten = call_qwen(
+            model, "",
+            CONDENSE_PROMPT.format(history=format_history(history), question=question),
+            timeout=120,
+        ).strip().strip('"')
+    except Exception:  # noqa: BLE001 - a condense failure must not lose the turn
+        return question
+    # A rewrite that collapses or rambles is worse than the original.
+    if not rewritten or len(rewritten) > 300:
+        return question
+    return rewritten.splitlines()[0].strip()
+
+
 def build_grounded_prompt(question: str, hits: list[dict]) -> str:
     parts = []
     for i, hit in enumerate(hits, 1):
@@ -459,19 +534,25 @@ def build_grounded_prompt(question: str, hits: list[dict]) -> str:
 
 
 def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
-           threshold: float = RELEVANCE_THRESHOLD) -> Answer:
+           threshold: float = RELEVANCE_THRESHOLD,
+           history: list[dict] | None = None) -> Answer:
     started = time.monotonic()
     not_found_reason = ""
+    # Follow-ups are resolved against the conversation before anything is
+    # searched. Retrieval itself is stateless.
+    search_query = condense_question(question, history or [], model)
+
     # Pull a wider pool, drop duplicate pages, then let the reranker decide the
     # order. The relevance threshold still uses the best dense score in the
     # pool, so reranking changes what is read, never how confident we are.
-    pool = search(question, k=RERANK_POOL)
+    pool = search(search_query, k=RERANK_POOL)
     top = max((h["score"] for h in pool), default=0.0)
-    hits = rerank(question, dedupe_by_source(pool)[:RERANK_KEEP], model)[:k]
+    hits = rerank(search_query, dedupe_by_source(pool)[:RERANK_KEEP], model)[:k]
 
     if hits and top >= threshold:
         kept = fit_chunks(hits)
-        raw = call_qwen(model, SYSTEM_GROUNDED, build_grounded_prompt(question, kept))
+        raw = call_qwen(model, SYSTEM_GROUNDED,
+                        build_grounded_prompt(search_query, kept))
         # The prompt ends primed with "ANSWERED:", so the reply continues from
         # there rather than repeating the label. Put it back before parsing.
         if not raw.lstrip().upper().startswith("ANSWERED"):
@@ -489,7 +570,8 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
                       file=sys.stderr, flush=True)
             else:
                 return Answer("GROUNDED", body, citations, top,
-                              time.monotonic() - started, len(kept), model, kept)
+                              time.monotonic() - started, len(kept), model, kept,
+                              search_query)
         # Retrieval was topically close but held no answer. Treat that exactly
         # like a below-threshold miss and let the classifier decide, so
         # "how do I improve my CGPA" can still fall to GENERAL rather than
@@ -502,10 +584,10 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
         # which is the one place nobody would think to look for one.
         not_found_reason = "" if unsupported_claims(body, kept) else body
 
-    if classify_question(model, question) == "GENERIC":
-        text = call_qwen(model, SYSTEM_GENERAL, question)
+    if classify_question(model, search_query) == "GENERIC":
+        text = call_qwen(model, SYSTEM_GENERAL, search_query)
         return Answer("GENERAL", f"{GENERAL_FLAG}\n\n{text}", [], top,
-                      time.monotonic() - started, 0, model)
+                      time.monotonic() - started, 0, model, [], search_query)
 
     preamble = (
         f"{not_found_reason}\n\n" if not_found_reason else
@@ -519,7 +601,8 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
         "  • Student Affairs (hostel, transport, clearance) — via giki.edu.pk/contact-us/\n"
         "  • Your academic advisor or the relevant faculty office"
     )
-    return Answer("REFUSE", text, [], top, time.monotonic() - started, 0, model)
+    return Answer("REFUSE", text, [], top, time.monotonic() - started, 0, model,
+                  [], search_query)
 
 
 def main() -> int:
