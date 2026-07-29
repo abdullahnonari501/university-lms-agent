@@ -14,6 +14,7 @@ follow-ups work -- storing messages alone would not.
 
 import argparse
 import json
+import socket
 import ssl
 import sys
 import threading
@@ -460,7 +461,23 @@ def main() -> int:
                     help="serve plain HTTP (microphone will be blocked off localhost)")
     args = ap.parse_args()
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    # Dual-stack. /etc/hosts resolves "localhost" to ::1 before 127.0.0.1 here,
+    # so an IPv4-only socket is invisible to anything that connects by name --
+    # which is how VS Code's port forwarding reaches a service.
+    class DualStackServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            super().server_bind()
+
+    host = args.host
+    try:
+        bind_host = "::" if host in ("0.0.0.0", "::", "") else host
+        server = DualStackServer((bind_host, args.port), Handler)
+    except OSError:
+        # No IPv6 on this kernel/interface -- fall back rather than refuse to run.
+        server = ThreadingHTTPServer((host, args.port), Handler)
 
     # Browsers refuse getUserMedia outside a secure context, so HTTPS is not
     # optional if the page is to be opened anywhere but localhost. A self-signed
