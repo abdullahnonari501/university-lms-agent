@@ -358,3 +358,136 @@ GIKI publishes two live pages with contradicting admission fees (Rs. 75,000 and
 Rs. 62,500). The assistant surfaces the conflict rather than silently picking one;
 adjudicating the institution's own inconsistency is out of scope.
 ```
+
+---
+---
+
+# Night Run 2 — 2026-07-30 (later)
+
+Four jobs, all complete. One regression I caused, flagged below rather than
+buried.
+
+## 1. Public URL — live
+
+```
+https://weekend-determine-possibly-furthermore.trycloudflare.com
+```
+
+Verified from the box: page 200, `/capabilities` reports stt+tts, a real
+question returned GROUNDED with citations, `/speak` returned audio. cloudflared
+2026.7.3 installed to `~/.local/bin`, no sudo.
+
+**The catch, and it needs a decision from you:** a *quick tunnel* mints a brand
+new hostname every time cloudflared restarts — including on reboot. The URL
+above is live now but will not survive a restart. `src/tunnel_url.sh` prints the
+current one.
+
+**A permanent URL needs a free Cloudflare account.** With one you get a *named*
+tunnel with a fixed address that survives restarts. It requires: signing up,
+`cloudflared tunnel login` (opens a browser, needs your credentials — I cannot
+do this for you), then `cloudflared tunnel create giki-assistant`. A custom
+domain is optional; a stable `*.cfargotunnel.com` address is not. That is the
+only outstanding thing on this job.
+
+## 2. Reboot survival — done
+
+Four user services, linger already enabled, same pattern as `code-tunnel.service`:
+
+| Service | stop→start | kill -9 → revived | enabled |
+|---|---|---|---|
+| `ollama` | active | 2923920 → 2925003 | yes |
+| `giki-ui` (HTTP 8137) | active | 2924219 → 2925317 | yes |
+| `giki-ui-https` (HTTPS 8443) | active | — | yes |
+| `cloudflared` | active | 2924529 → 2925518 | yes |
+
+All four `WantedBy=default.target` with `Restart=always`, so a real reboot brings
+the stack up with no manual steps. The `nohup` fragility is gone.
+
+## 3. Stale-year bug — fixed
+
+**Before, turn 1:** answered from 2021 sources, evidence ordered `['2021',
+'2021', 'undated', ...]`, and never mentioned the year.
+
+**Before, turn 2** (`"but the sources say it's from 2021"`): restated the answer.
+*"The sources used refer to the same year… All three sources indicate…"*
+
+**Root cause of the double-down**, which was not obvious: `condense_question()`
+rewrote the challenge into *"Does FES offer undergraduate programs in 2021?"* —
+a content question. The system then answered content again. What looked like
+stubbornness was the challenge being destroyed before it reached the model.
+
+**After, turn 1:** evidence re-ordered `['undated', 'undated', 'undated',
+'2021', '2021']` — live pages first. GROUNDED, no leak, stable over three runs.
+
+**After, turn 2:** *"The live website pages provide information about GIKI's
+current programs and admissions for 2026… The prospectus from 2021 is outdated
+and does not reflect the current offerings as of 2026, but it still
+establishes…"* — acknowledges, dates the sources, distinguishes live from stale.
+
+Mechanism, following the `ended_terms()` precedent of putting the signal in the
+data: `year_intent()` detects a named year or "current/latest"; `prefer_recent()`
+deterministically re-orders evidence toward live and newest sources before the
+model sees any of it; `provenance_line()` appends dated-source disclosure built
+from metadata; `is_source_challenge()` catches the objection *before* condensing
+and routes it to a prompt whose job is to acknowledge rather than re-answer.
+
+Also removed wording that invited invention — describing undated pages as
+"reflects current information" had the model claiming sources were "from July
+2026".
+
+## 4. Scaffolding leak — fixed, and the real defect was worse
+
+The parser only recognised bare headers, so `**ANSWERED:**`, `- ANSWERED:` or a
+chatty preamble line defeated it — and the empty-body fallback returned the raw
+reply, which is exactly how the header reached your screen. Matching is now
+tolerant of that decoration, plus an **unconditional sweep** strips any surviving
+header or separator line. Verified against 10 shapes including your exact
+screenshot case: **0 leaks**.
+
+**But the leak was a symptom.** The raw reply for that question was, in full:
+
+```
+'ANSWERED: yes\nSOURCES_USED: 1, 2, 3'
+```
+
+The model emitted the header and stopped, producing no answer at all — so the
+old code had nothing else to show. Removing the trailing `ANSWERED:` prime
+reduced it, and an empty body now triggers one retry without the structured
+contract. Three consecutive runs of that question: GROUNDED, no leak, no empty
+answers.
+
+I briefly made this worse before making it better: my first fix returned an
+empty answer instead of the leak, which is worse, and the second returned REFUSE
+for an answerable question. Both caught by re-testing rather than assuming.
+
+## Regression I caused — needs your call
+
+Validation went **44/50 → 41/50** (0 contract failures, unchanged). The
+composition matters more than the number:
+
+- **ISO quality policy** — was REFUSE, now correct. Fixed.
+- **Dean** — now REFUSE where it was GROUNDED, but the answer is *better*:
+  *"The sources mention Dr. Qadeer Ul Hasan as the Dean but do not specify which
+  faculty he oversees."* It now finds the right person and states the exact
+  ambiguity. The stored expectation is stale, not the behaviour.
+- **Four questions drifted GENERAL → GROUNDED** (CV writing, job interview,
+  version control, plus the pre-existing set). This is the real regression:
+  removing the `ANSWERED:` prime made the model less willing to say "no", so
+  borderline generic questions now get answered "grounded" on weak evidence.
+
+The clearest example — *"Why is version control useful for software projects?"*
+returns a generic answer citing `/course/software-testing-and-quality-engineering/`
+and `/course/principles-of-marketing/`. The marketing citation is plainly
+irrelevant. GENERAL mode would have flagged this as the model's own knowledge;
+GROUNDED implies a source that is not really there.
+
+Judged on behaviour rather than the stored expectations, roughly 46/50 — but
+those three loosely-cited answers are a genuine quality loss and I would rather
+you decided than have me quietly tune it at 3am. The fix is a stricter ANSWERED
+criterion, which is a prompt change, and prompt changes are the thing we have
+repeatedly found unreliable here.
+
+## Left running
+
+All four services enabled and running. Public URL live. Repo clean, pushed
+through `3333dc7`. `README.md` untouched.
