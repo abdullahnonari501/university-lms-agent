@@ -72,6 +72,14 @@ Every source carries a CURRENCY line. Obey it:
   2019 to 2023". If no source names a current holder, say the sources do not
   name the current one rather than offering a predecessor as the answer.
 
+If the student pushes back that a source is old or from a particular year,
+acknowledge it directly -- say which year the sources are from and what they do
+and do not show for the year asked. Never repeat the previous answer as if the
+objection had not been raised.
+
+If the question names a year and the sources predate it, say so plainly: the
+sources describe an earlier year and may not reflect that one.
+
 The CURRENCY lines are internal notes for you. Never mention them, never write
 "according to the WARNING" or "the CURRENCY line says" -- state the fact itself
 ("Dr. X served as Dean from 2019 to 2023").
@@ -183,6 +191,34 @@ def fit_chunks(hits: list[dict]) -> list[dict]:
     return kept
 
 
+# Tolerant of the decorations the model puts around the header: "**ANSWERED:**",
+# "- ANSWERED:", "# ANSWERED:", leading whitespace.
+HEADER_LINE_RE = re.compile(
+    r"^[\s\-*#>`]*\**\s*(ANSWERED|SOURCES_USED)\s*:?\**\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+SEPARATOR_RE = re.compile(r"^[\s*]*-{2,}[\s*]*$")
+
+
+def strip_scaffolding(text: str) -> str:
+    """Remove any surviving header/separator lines, wherever they ended up.
+
+    The guarantee, not the optimisation. Parsing recognises the common shapes,
+    but a model can decorate the header in ways no matcher anticipates -- bold,
+    bulleted, or preceded by a chatty line -- and every one of those dumped the
+    raw scaffolding into the user's answer bubble. Sweeping the final body means
+    a parse miss degrades to a slightly odd answer, never to leaked machinery.
+    """
+    kept = []
+    for line in text.splitlines():
+        if HEADER_LINE_RE.match(line):
+            continue
+        if SEPARATOR_RE.match(line) and not kept:
+            continue          # separator before any real content
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
     """Pull the ANSWERED / SOURCES_USED header off the reply.
 
@@ -201,24 +237,28 @@ def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
 
     lines = raw.splitlines()
     consumed = 0
-    for line in lines[:6]:
+    # Scan a few lines rather than stopping at the first non-header: the model
+    # sometimes writes a sentence before the header it was asked to lead with.
+    for line in lines[:8]:
         stripped = line.strip()
-        upper = stripped.upper()
-        if upper.startswith("ANSWERED:"):
-            answered = "NO" not in upper.split(":", 1)[1].strip().upper()[:3]
+        match = HEADER_LINE_RE.match(line)
+        if match:
+            field, value = match.group(1).upper(), match.group(2)
+            if field == "ANSWERED":
+                answered = "NO" not in value.strip().upper()[:3]
+            else:
+                named = [int(n) for n in re.findall(r"\d+", value)]
             header_seen = True
             consumed += 1
-        elif upper.startswith("SOURCES_USED:"):
-            named = [int(n) for n in re.findall(r"\d+", stripped.split(":", 1)[1])]
-            header_seen = True
-            consumed += 1
-        elif stripped == "---" and header_seen:
+        elif SEPARATOR_RE.match(line) and header_seen:
             consumed += 1
             break
         elif not stripped:
             consumed += 1
-        else:
+        elif header_seen:
             break
+        else:
+            consumed += 1   # chatty preamble before the header; drop it
 
     if header_seen:
         rest = lines[consumed:]
@@ -230,6 +270,10 @@ def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
         ):
             rest.pop(0)
         body = "\n".join(rest).strip()
+
+    # Unconditional final sweep -- see strip_scaffolding(). Applied outside the
+    # header branch so the no-header path is covered too.
+    body = strip_scaffolding(body)
 
     # Validate: a cited URL must be one we actually retrieved. Anything the
     # model names outside that set is dropped, so it can never introduce a URL.
@@ -246,7 +290,9 @@ def parse_structured(raw: str, hits: list[dict]) -> tuple[bool, list[str], str]:
             if url and url not in citations:
                 citations.append(url)
 
-    return answered, citations, body or raw.strip()
+    # The empty-body fallback must be swept as well: returning raw here is
+    # precisely how the scaffolding reached the user's screen.
+    return answered, citations, body or strip_scaffolding(raw)
 
 
 NAME_PATTERN = re.compile(r"\b(?:Dr|Prof|Professor|Mr|Ms|Mrs|Engr)\.?\s+([A-Z][A-Za-z.\-']+(?:\s+[A-Z][A-Za-z.\-']+){0,3})")
@@ -416,6 +462,67 @@ def ended_terms(text: str) -> list[str]:
     return found
 
 
+YEAR_IN_QUESTION_RE = re.compile(r"\b(20\d{2})\b")
+CURRENCY_WORDS_RE = re.compile(
+    r"\b(current|currently|latest|now|nowadays|this year|these days|up to date|"
+    r"up-to-date|present|today)\b", re.IGNORECASE)
+
+
+def year_intent(question: str) -> tuple[int | None, bool]:
+    """(year named in the question, whether it asks for current state).
+
+    Both make a question date-sensitive: "in 2026" and "what are the current
+    fees" must not be answered from a 2021 prospectus without saying so.
+    """
+    match = YEAR_IN_QUESTION_RE.search(question)
+    return (int(match.group(1)) if match else None,
+            bool(CURRENCY_WORDS_RE.search(question)))
+
+
+def prefer_recent(hits: list[dict]) -> list[dict]:
+    """Stable re-sort putting current sources first.
+
+    Undated means a live site page, which reflects what is true now, so it
+    outranks any dated document; dated sources then order newest first. Applied
+    only to date-sensitive questions, and done here rather than asked of the
+    model, because the model cannot be relied on to weigh recency itself.
+    """
+    def key(item: tuple[int, dict]) -> tuple[int, int, int]:
+        i, hit = item
+        raw = hit.get("source_date") or ""
+        if not raw:
+            return (0, 0, i)                 # undated == current, goes first
+        try:
+            return (1, -int(raw), i)         # then newest dated
+        except ValueError:
+            return (1, 0, i)
+    return [h for _, h in sorted(enumerate(hits), key=key)]
+
+
+def provenance_line(hits: list[dict], body: str) -> str:
+    """A dated-source disclosure built from metadata, not from model compliance.
+
+    The model was told to date its claims and did not: asked about 2026 it
+    answered from the 2021 prospectus and said nothing about the year. Stating
+    it deterministically is the only version that cannot be ignored.
+    """
+    years: dict[str, None] = {}
+    for hit in hits:
+        raw = hit.get("source_date") or ""
+        if raw and raw not in years:
+            years[raw] = None
+    if not years:
+        return ""
+    # Already dated in prose? Then adding a second note is noise.
+    if all(y in body for y in years):
+        return ""
+    listed = ", ".join(
+        f"{y} ({CURRENT_YEAR - int(y)} yr old)" if int(y) < CURRENT_YEAR else y
+        for y in sorted(years, reverse=True)
+    )
+    return f"\n\nSource dates: {listed}. Newer information may supersede this."
+
+
 def source_note(hit: dict) -> str:
     """One line telling the model how current this source is."""
     bits = []
@@ -425,7 +532,9 @@ def source_note(hit: dict) -> str:
             bits.append(f"{CURRENT_YEAR - int(hit['source_date'])} year(s) old — "
                         "may be superseded")
     else:
-        bits.append("live website page, undated — reflects current information")
+        # Deliberately gives no date: saying "current" invited the model to
+        # invent one ("from July 2026") for pages that carry no date at all.
+        bits.append("live website page, no publication date, kept up to date")
 
     ended = ended_terms(hit.get("text", ""))
     if ended:
@@ -484,6 +593,42 @@ def format_history(history: list[dict], cap: int = HISTORY_CHAR_CAP) -> str:
     return out[-cap:] if len(out) > cap else out
 
 
+SOURCE_CHALLENGE_RE = re.compile(
+    r"(that'?s|thats|it'?s|its|they'?re|sources?|prospectus|document|page|info\w*)"
+    r".{0,40}\b(from\s+20\d{2}|20\d{2}|old|outdated|out of date|stale|"
+    r"not current|no longer)\b"
+    r"|^\s*(but|however|isn'?t|aren'?t|wasn'?t)\b.{0,60}\b(20\d{2}|old|outdated)\b",
+    re.IGNORECASE,
+)
+
+
+def is_source_challenge(question: str) -> bool:
+    """True when the student is disputing the currency of the last answer.
+
+    This must be caught *before* condensing. "but the sources say it's from
+    2021" gets rewritten into "Does FES offer undergraduate programs in 2021?"
+    -- a content question -- so the system answered content again, which is
+    exactly what a double-down looks like from the outside.
+    """
+    return bool(SOURCE_CHALLENGE_RE.search(question.strip()))
+
+
+SYSTEM_CHALLENGE = """You are a helpful assistant for students of GIK Institute (GIKI), Pakistan.
+
+The student is questioning how current your previous answer was. Do NOT simply
+repeat that answer.
+
+- Acknowledge the objection in your first sentence.
+- State plainly which years the sources below are from, using their CURRENCY
+  lines. Sources with no publication date are live website pages -- describe
+  them as "the live website", never as being from a particular year.
+- Say what those sources do and do not establish for the year the student asked
+  about. If nothing covers that year, say so.
+- Be brief and direct. Do not be defensive.
+
+Never mention the CURRENCY lines themselves -- state the years as fact."""
+
+
 def condense_question(question: str, history: list[dict], model: str) -> str:
     """Turn a follow-up into something retrievable on its own.
 
@@ -529,7 +674,8 @@ def build_grounded_prompt(question: str, hits: list[dict]) -> str:
         "---\n"
         "<your answer>\n\n"
         "If ANSWERED is no, say briefly what the sources are missing.\n\n"
-        "ANSWERED:"
+        "The answer itself must come after the --- line. Do not stop at the "
+        "header.\n"
     )
 
 
@@ -540,7 +686,14 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
     not_found_reason = ""
     # Follow-ups are resolved against the conversation before anything is
     # searched. Retrieval itself is stateless.
-    search_query = condense_question(question, history or [], model)
+    challenge = bool(history) and is_source_challenge(question)
+    if challenge:
+        # Keep the student's words, but retrieve against what they were actually
+        # asking about, so the same evidence is on the table to be dated.
+        prior = [h["content"] for h in (history or []) if h.get("role") == "user"]
+        search_query = prior[-1] if prior else question
+    else:
+        search_query = condense_question(question, history or [], model)
 
     # Pull a wider pool, drop duplicate pages, then let the reranker decide the
     # order. The relevance threshold still uses the best dense score in the
@@ -549,17 +702,37 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
     top = max((h["score"] for h in pool), default=0.0)
     hits = rerank(search_query, dedupe_by_source(pool)[:RERANK_KEEP], model)[:k]
 
+    # Date-sensitive questions get their evidence re-ordered toward current
+    # sources before the model sees any of it.
+    named_year, wants_current = year_intent(f"{question} {search_query}")
+    if named_year or wants_current:
+        hits = prefer_recent(hits)
+
     if hits and top >= threshold:
         kept = fit_chunks(hits)
-        raw = call_qwen(model, SYSTEM_GROUNDED,
-                        build_grounded_prompt(search_query, kept))
-        # The prompt ends primed with "ANSWERED:", so the reply continues from
-        # there rather than repeating the label. Put it back before parsing.
-        if not raw.lstrip().upper().startswith("ANSWERED"):
-            raw = f"ANSWERED: {raw.lstrip()}"
+        system = SYSTEM_CHALLENGE if challenge else SYSTEM_GROUNDED
+        asked = question if challenge else search_query
+        raw = call_qwen(model, system, build_grounded_prompt(asked, kept))
         # Citations resolve through chunk metadata by index, so the model can
         # only ever narrow the retrieved set -- it cannot introduce a URL.
         answered, citations, body = parse_structured(raw, kept)
+
+        # The model sometimes emits the header and stops, producing no answer at
+        # all. That is the real defect behind the scaffolding appearing on
+        # screen: with nothing after the header, the old code displayed the
+        # header. Retry once without the structured contract rather than
+        # refusing a question the sources can answer.
+        if answered and not body.strip():
+            retry = call_qwen(model, system, (
+                build_grounded_prompt(asked, kept).split("Reply in exactly this format")[0]
+                + "Answer the question directly. Do not include any header or "
+                  "metadata lines."))
+            body = strip_scaffolding(retry)
+            citations = [h["source_url"] for h in kept if h.get("source_url")]
+            print("  [retry] model returned header only; re-asked without the "
+                  "structured contract", file=sys.stderr, flush=True)
+        if not body.strip():
+            answered = False
         if answered:
             # Last line of defence: a name or figure that appears in no chunk is
             # fabricated, whatever the model claimed. Drop to the classifier
@@ -569,6 +742,10 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
                 print(f"  [guard] dropped unsupported claim(s): {invented}",
                       file=sys.stderr, flush=True)
             else:
+                # Disclose dated sources from metadata. The prompt asks for this
+                # too, but only the deterministic version actually happens.
+                cited = [h for h in kept if h.get("source_url") in set(citations)] or kept
+                body += provenance_line(kept if challenge else cited, body)
                 return Answer("GROUNDED", body, citations, top,
                               time.monotonic() - started, len(kept), model, kept,
                               search_query)
