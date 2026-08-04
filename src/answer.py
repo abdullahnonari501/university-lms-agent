@@ -653,6 +653,53 @@ def condense_question(question: str, history: list[dict], model: str) -> str:
     return rewritten.splitlines()[0].strip()
 
 
+# Words too common to indicate anything about where an answer came from.
+SUPPORT_STOPWORDS = set("""
+the a an and or of to in for on with is are was were be been by as at from that
+this these those it its he she they them their there here which who whom whose
+what when where why how can could should would may might will shall must do
+does did doing done have has had having not no nor but if then than so such also
+into about over under you your yours we our ours my mine while during before
+after above below between each other any all some most more less very much many
+few both either neither per via within without across upon
+""".split())
+SUPPORT_TOKEN_RE = re.compile(r"[a-z][a-z0-9\-']+")
+
+# Measured, not chosen. Over 15 generated answers the lowest genuinely grounded
+# answer scored 0.651 and the highest gateable general-knowledge answer 0.545,
+# so 0.60 sits in a real gap. The margin above the lowest good sample is only
+# 0.05, which is thin -- if grounded answers start being gated, this is the
+# number to revisit, and data/logs/support_gate_samples.json holds the evidence.
+SUPPORT_GATE = 0.60
+SUPPORT_MIN_WORDS = 12          # too short to measure meaningfully
+
+
+def _content_words(text: str) -> list[str]:
+    return [w for w in SUPPORT_TOKEN_RE.findall(text.lower())
+            if w not in SUPPORT_STOPWORDS and len(w) > 3]
+
+
+def evidence_support(body: str, cited: list[dict]) -> float:
+    """Fraction of the answer's distinctive vocabulary present in its sources.
+
+    This is a *derivation* test, not a topic test, and that distinction is the
+    whole point. Embedding similarity was tried first and failed outright: a
+    general answer about version control is genuinely close in vector space to a
+    software-engineering course page, so cosine scored the bad answers as high
+    as the good ones (good min 0.838 vs drift max 0.875 -- no separation at all).
+
+    An answer written from the corpus reuses the corpus's words. One written
+    from the model's own knowledge does not, however relevant it looks. The
+    canonical failure -- a version-control answer citing a marketing course --
+    scores 0.075 here against 0.65-0.92 for genuinely grounded answers.
+    """
+    words = set(_content_words(body))
+    if len(words) < SUPPORT_MIN_WORDS or not cited:
+        return 1.0                      # unmeasurable: do not gate on noise
+    evidence = set(_content_words(" ".join(h.get("text", "") for h in cited)))
+    return len(words & evidence) / len(words)
+
+
 def build_grounded_prompt(question: str, hits: list[dict]) -> str:
     parts = []
     for i, hit in enumerate(hits, 1):
@@ -737,11 +784,20 @@ def answer(question: str, model: str = DEFAULT_MODEL, k: int = TOP_K,
             # Last line of defence: a name or figure that appears in no chunk is
             # fabricated, whatever the model claimed. Drop to the classifier
             # rather than emit an invented fact wearing citations.
+            # A citation that does not support the claim breaks the GROUNDED
+            # promise as surely as a fabricated one, so this gate sits beside
+            # the fabrication guard rather than in the prompt.
+            cited_now = [h for h in kept if h.get("source_url") in set(citations)] or kept
+            support = evidence_support(body, cited_now)
+            if support < SUPPORT_GATE:
+                print(f"  [gate] weak evidence support {support:.3f} < "
+                      f"{SUPPORT_GATE}; not GROUNDED", file=sys.stderr, flush=True)
+
             invented = unsupported_claims(body, kept)
             if invented:
                 print(f"  [guard] dropped unsupported claim(s): {invented}",
                       file=sys.stderr, flush=True)
-            else:
+            elif support >= SUPPORT_GATE:
                 # Disclose dated sources from metadata. The prompt asks for this
                 # too, but only the deterministic version actually happens.
                 cited = [h for h in kept if h.get("source_url") in set(citations)] or kept
