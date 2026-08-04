@@ -665,12 +665,20 @@ few both either neither per via within without across upon
 """.split())
 SUPPORT_TOKEN_RE = re.compile(r"[a-z][a-z0-9\-']+")
 
-# Measured, not chosen. Over 15 generated answers the lowest genuinely grounded
-# answer scored 0.651 and the highest gateable general-knowledge answer 0.545,
-# so 0.60 sits in a real gap. The margin above the lowest good sample is only
-# 0.05, which is thin -- if grounded answers start being gated, this is the
-# number to revisit, and data/logs/support_gate_samples.json holds the evidence.
-SUPPORT_GATE = 0.60
+# Measured, and deliberately conservative. A first pass at 0.60 sat in the gap
+# between the sampled good (min 0.651) and bad (max 0.545) answers, but that
+# 0.05 margin did not survive contact: generation varies run to run, and the
+# metric is biased against short sources -- the ISO policy page is 64 words, so
+# a grounded answer about it necessarily uses connective words the chunk lacks
+# and scored 0.423. At 0.60 the gate rejected three legitimate answers to fix
+# three bad ones, which is a trade, not a fix.
+#
+# 0.30 keeps a wide margin instead: the canonical failure (version control,
+# citing a marketing course) measured 0.075-0.206 across runs, while the weakest
+# genuinely grounded answer measured 0.423. Gating a good answer is worse than
+# missing a weak one, so the threshold sits where it cannot do the former.
+# Evidence: data/logs/support_gate_samples.json.
+SUPPORT_GATE = 0.30
 SUPPORT_MIN_WORDS = 12          # too short to measure meaningfully
 
 
