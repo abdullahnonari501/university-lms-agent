@@ -243,7 +243,7 @@ async function send() {
 
 // ---------------------------------------------------------------- voice
 let caps = {stt:false, tts:false};
-let recorder = null, chunks = [], recording = false;
+let recorder = null, chunks = [], recording = false, levelCtx = null, heard = false;
 const mic = document.getElementById('mic');
 const auto = document.getElementById('auto');
 const hint = document.getElementById('hint');
@@ -299,17 +299,47 @@ async function startRec() {
         const d = await r.json();
         if (d.error) throw new Error(d.error);
         if (d.text) { box.value = (box.value ? box.value + ' ' : '') + d.text; box.focus(); }
-        hint.textContent = d.text ? '' : "Didn't catch that — try again.";
+        if (d.silent) {
+          hint.textContent = `No sound reached the server (${d.seconds}s recorded, `
+            + `peak ${d.peak}). Check the browser is using the right microphone, `
+            + `that it is not muted, and that this page is open on the device with the mic.`;
+        } else {
+          hint.textContent = d.text ? '' : "Didn't catch that — try again.";
+        }
       } catch (e) {
         hint.textContent = 'Transcription failed: ' + e.message;
       } finally {
         mic.disabled = false;
       }
     };
+    // Live level meter. Silence is invisible until it is too late otherwise --
+    // you only find out when the transcript comes back wrong.
+    try {
+      const ac = new AudioContext();
+      const src = ac.createMediaStreamSource(stream);
+      const an = ac.createAnalyser();
+      an.fftSize = 512;
+      src.connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      levelCtx = ac;
+      const tick = () => {
+        if (!recording) { ac.close().catch(() => {}); levelCtx = null; return; }
+        an.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (const v of buf) peak = Math.max(peak, Math.abs(v - 128) / 128);
+        heard = heard || peak > 0.02;
+        const bars = '▁▂▃▄▅▆▇█';
+        const n = Math.min(bars.length - 1, Math.round(peak * 22));
+        hint.textContent = `Listening ${bars[n].repeat(12)}  `
+          + (heard ? '' : '(no sound yet — is the right mic selected?)');
+        requestAnimationFrame(tick);
+      };
+      tick();
+    } catch (e) { /* meter is a nicety; never block recording */ }
+
     recorder.start();
     recording = true;
     mic.classList.add('rec');
-    hint.textContent = 'Listening… click the mic again to stop.';
   } catch (e) {
     hint.textContent = 'Microphone blocked: ' + e.message;
   }
@@ -317,7 +347,7 @@ async function startRec() {
 
 mic.onclick = () => {
   if (recording) { recording = false; recorder.stop(); }
-  else startRec();
+  else { heard = false; startRec(); }
 };
 
 let audioEl = null;
@@ -387,6 +417,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             text = voice.transcribe(self.rfile.read(length))
             body = json.dumps({"text": text}).encode()
+        except voice.SilentAudio as quiet:
+            # Report it honestly instead of letting Whisper's silence
+            # hallucination ("you") reach the user as if it were speech.
+            body = json.dumps({
+                "text": "",
+                "silent": True,
+                "peak": round(quiet.peak, 4),
+                "seconds": round(quiet.seconds, 1),
+            }).encode()
         except Exception as exc:  # noqa: BLE001
             body = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode()
         self._send(200, body, "application/json")

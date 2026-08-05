@@ -111,11 +111,41 @@ def resample(samples: list[float], src: int, dst: int = 16000) -> list[float]:
     return out
 
 
+# Whisper emits "you" for silence -- a hallucination, not a transcription, and
+# a deeply confusing one to see in a chat box. Detect the silence instead and
+# say so, rather than passing a made-up word off as what the user said.
+SILENCE_PEAK = 0.01
+
+
+def audio_levels(samples: list[float]) -> tuple[float, float]:
+    """(peak, rms) so a caller can tell silence from speech."""
+    if not samples:
+        return 0.0, 0.0
+    peak = max(abs(s) for s in samples)
+    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+    return peak, rms
+
+
+class SilentAudio(Exception):
+    """Raised when the recording contains no audible signal."""
+
+    def __init__(self, peak: float, rms: float, seconds: float):
+        super().__init__(f"peak={peak:.4f} rms={rms:.4f} {seconds:.1f}s")
+        self.peak, self.rms, self.seconds = peak, rms, seconds
+
+
 def transcribe(wav_bytes: bytes) -> str:
     load_stt()
     samples, rate = read_wav(wav_bytes)
+    seconds = len(samples) / rate if rate else 0.0
+    peak, rms = audio_levels(samples)
+    print(f"  [voice] audio {seconds:.1f}s peak={peak:.4f} rms={rms:.4f} "
+          f"rate={rate}", flush=True)
+
     if len(samples) < rate * 0.2:          # under 200 ms is a stray click
-        return ""
+        raise SilentAudio(peak, rms, seconds)
+    if peak < SILENCE_PEAK:
+        raise SilentAudio(peak, rms, seconds)
     audio = resample(samples, rate)
 
     import torch
