@@ -115,6 +115,19 @@ editor + autocomplete only. Don't run both agents against the same repo.
   restricted, so stdlib `wave` reads it server-side.
   `STT_VOCAB` biases Whisper toward GIKI/FCSE/CGPA; keep collision-prone
   acronyms out of it (FES made Whisper hear "fees" as "FES").
+- **Public URL is permanent**: https://chevron-acts-scale.ngrok-free.dev
+  ngrok free tier, one reserved static domain, run as the `ngrok` user service
+  (`--url=` pins it). Survives kill -9 and reboot; verified. Cloudflare was
+  abandoned: a *named* tunnel needs a domain on a Cloudflare zone, and
+  `*.cfargotunnel.com` is not publicly routable on its own. The cloudflared
+  quick tunnel still works but mints a new hostname on every restart, so
+  `cloudflared.service` is installed-but-disabled as a fallback.
+  Free tier caveats: one online agent at a time, and a one-time browser
+  interstitial for first-time visitors.
+- **Services** (all `systemd --user`, linger on, `Restart=always`):
+  `ollama`, `giki-ui` (HTTP 8137, what ngrok fronts), `giki-ui-https`
+  (HTTPS 8443 for LAN + microphone), `ngrok`. A reboot brings everything back
+  with no manual steps.
 - **Data is backed up off-box** — GitHub Release `data-backup-20260730`,
   224 MB tar of `data/`. `data/` stays gitignored; restore with
   `tar xzf giki-data-*.tar.gz -C .` after cloning. Re-take this after any
